@@ -1,0 +1,15 @@
+# editor settings
+*.vscode/
+
+# build cache
+*.cache
+
+# compilation outputs
+*.o
+*.a
+
+# large files
+*lqr_constants.c
+
+*__pycache__
+*venv
