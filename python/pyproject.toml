@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whippyflight"
+version = "0.1.0"
+description = "Gain generation for whippyflight-control: DARE over a motor-speed grid, packed into .wfg blobs"
+readme = "../README.md"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "Oblarg" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2",
+    "scipy>=1.13",
+    "control>=0.10",
+    "frccontrol>=2024",
+]
+
+[project.optional-dependencies]
+plots = ["matplotlib>=3.8"]
+
+[tool.setuptools]
+packages = ["whippyflight"]

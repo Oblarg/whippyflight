@@ -1,0 +1,21 @@
+[package]
+name = "whippyflight-sim"
+description = "Nonlinear multirotor plant and stick-flick evaluation for whippyflight-control"
+keywords = ["lqr", "multirotor", "simulation"]
+categories = ["science::robotics", "simulation"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+whippyflight-control = { workspace = true, features = ["std", "airframe-drag"] }
+whippyunits = { workspace = true, features = ["std"] }
+# The plant reads fit_model.py's coefficient JSON.
+serde_json.workspace = true
+
+[dev-dependencies]
+bytemuck.workspace = true
+whippyalgebra.workspace = true
