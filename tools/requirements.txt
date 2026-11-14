@@ -1,0 +1,12 @@
+# The development environment: the whippyflight package (editable) and the
+# versions the eval baseline was recorded with.
+#
+#   python3 -m venv tools/.venv
+#   tools/.venv/bin/pip install -r tools/requirements.txt
+-e ../python[plots]
+-e ../adapters/betaflight/python[plots]
+numpy==2.3.2
+scipy==1.16.1
+control==0.10.2
+frccontrol==2024.23
+matplotlib==3.10.5

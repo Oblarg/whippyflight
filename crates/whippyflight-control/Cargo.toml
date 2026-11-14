@@ -1,0 +1,34 @@
+[package]
+name = "whippyflight-control"
+description = "Gain-scheduled LQR attitude-rate controller for multirotors, firmware-agnostic and no_std"
+keywords = ["lqr", "multirotor", "flight-controller", "no-std", "control"]
+categories = ["no-std", "embedded", "science::robotics"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Unit-safe quantities and linear algebra; both no_std, no alloc.
+whippyunits.workspace = true
+whippyalgebra.workspace = true
+# Correctly rounded sqrtf for no_std (core has none); already in the
+# dependency graph through whippyunits.
+libm.workspace = true
+# Zero-copy typed views of the gain blob's tables.
+bytemuck.workspace = true
+
+[features]
+default = []
+# Host builds: std for whippyunits/whippyalgebra, Debug impls, and
+# `gains::static_blob`.
+std = ["whippyunits/std", "whippyalgebra/std"]
+# Compensate the rotor-drag torque of tall frames from the accelerometer
+# when the blob has a drag model.  Off by default: small frames don't need
+# it, and without it the block is parsed but ignored.
+airframe-drag = []
+
+[dev-dependencies]
+whippyflight-control = { path = ".", features = ["std", "airframe-drag"] }

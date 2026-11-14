@@ -1,15 +1,6 @@
-# editor settings
-*.vscode/
-
-# build cache
-*.cache
-
-# compilation outputs
-*.o
-*.a
-
-# large files
-*lqr_constants.c
-
-*__pycache__
-*venv
+target/
+/out/
+.venv/
+__pycache__/
+*.egg-info/
+.DS_Store
