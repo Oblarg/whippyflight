@@ -7,9 +7,12 @@
 //! # Units
 //!
 //! SI-adjacent units throughout: rates and motor shaft speeds in rot/s,
-//! voltages in V, specific force in m/s², time in s.  Motor output is a
-//! duty fraction [0, 1] and throttle a fraction [0, 1].  A firmware adapter
-//! converts its own units on the way in and out.
+//! voltages in V, specific force in m/s², time in s.  Throttle is a
+//! fraction [0, 1].  A firmware adapter converts its own units on the way
+//! in and out.
+//!
+//! Motor output is duty [0, 1]: applied voltage over
+//! [`SensorData::battery_voltage`], the ceiling allocation saturates against.
 //!
 //! # Axes
 //!

@@ -1,0 +1,236 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{graphicx} % Required for inserting images
+\usepackage[margin=1in]{geometry}
+\usepackage{float}
+\begin{document}
+
+\section{Variables}
+
+\subsection{Constants}
+
+\begin{equation}
+\begin{aligned}
+     \Vec{D}_{fl} \coloneqq& \text{Displacement from center-of-mass of front-left rotor (3-dimensional)}\\
+     \Vec{N} \coloneqq& \text{Rotor plane normal vector (fixed to the +z unit vector)}
+\end{aligned}
+\end{equation}
+
+\subsection{Inputs}
+\begin{equation}
+\begin{aligned}
+     V_{fl} \coloneqq& \text{Voltage applied to front left motor}
+\end{aligned}
+\end{equation}
+
+\subsection{Outputs}
+\begin{equation}
+\begin{aligned}
+     \omega_{fl} \coloneqq& \text{Angular velocity of front left rotor}\\
+     \dot{\omega_{fl}} \coloneqq& \text{Angular acceleration of front left rotor}\\
+     \vec{T}_{fl} \coloneqq& \text{Thrust of the front left rotor}\\
+     \vec{\tau}_{fl} \coloneqq& \text{Torque vector of the front left rotor}\\
+     \gamma \coloneqq& \text{Yaw angle of drone}\\
+     \phi \coloneqq& \text{Pitch angle of drone}\\
+     \theta \coloneqq& \text{Roll angle of drone}\\
+\end{aligned}
+\end{equation}
+
+\section{Dynamics}
+
+\subsection{Rotors}
+
+\begin{equation}
+\begin{aligned}
+    V =& k_{\omega}(\omega) + k_{\omega^2}(\omega^2) + k_{\alpha}(\dot{\omega})\\
+    \vec{T} =& k_T(\omega_m^2)\vec{N}\\
+    \vec{\tau} =& k_{\tau}(\omega_m^2)\vec{N}\\
+\end{aligned}
+\end{equation}
+
+\subsection{Airframe}
+
+\subsubsection{Yaw}
+\begin{equation}
+\begin{aligned}
+    \ddot{\gamma} =& \rho_{yaw,lin}(\dot{\gamma}) + \rho_{yaw,quad}(\dot{\gamma}^2) + \sum_{m \in fl, fr, bl, br} \pm \left(k_{inertia} (\dot{\omega_{m}}) + k_\tau(\omega_{m}^2)\right)
+\end{aligned}
+\end{equation}
+where the sign represents whether sensor-forward for the rotor is clockwise or anticlockwise (we adopt the convention that positive RPM corresponds to positive thrust, so this depends on the diagonal on which the rotor lies).
+
+Regrouping by terms, we obtain the regression equation:
+
+\begin{equation}
+\begin{aligned}
+    \ddot{\gamma} = \rho_{yaw,lin}(\dot{\gamma}) + \rho_{yaw,quad}(\dot{\gamma}^2) +& k_{inertia}(\dot{\omega_{fl}} - \dot{\omega_{fr}} - \dot{\omega_{bl}} + \dot{\omega_{br}})\\
+    +& k_\tau(\omega_{fl}^2 - \omega_{fr}^2 - \omega_{bl}^2 + \omega_{br}^2)
+\end{aligned}
+\end{equation}
+
+\subsubsection{Pitch and Roll}
+Signs here are given for pitch by front (+) vs back (-) and for roll by left (+) vs right (-). 
+\begin{equation}
+\begin{aligned}
+    \ddot{\phi} =& \rho_{pitch,lin}(\dot{\phi}) + \rho_{pitch,quad}(\dot{\phi}^2) + \sum_{m \in fl, fr, bl, br} \pm ||\vec{D_m} \times \vec{x}||\left(k_T(\omega_{m}^2)\right)\\
+    \ddot{\theta} =& \rho_{roll,lin}(\dot{\theta}) + \rho_{roll,quad}(\dot{\theta}^2) + \sum_{m \in fl, fr, bl, br} \pm ||\vec{D_m} \times \vec{y}||\left(k_T(\omega_{m}^2)\right)
+\end{aligned}
+\end{equation}
+
+\subsection{Linearization}
+By Taylor expansion:
+\begin{equation}
+\begin{aligned}
+    ax + bx^2 &=_{x \sim x_0} (bx_0^2 + 2bx_0(x-x_0)) + ax\\
+    &= (a + 2bx_0)x - bx_0^2
+\end{aligned}
+\end{equation}
+We expand at $\omega_m \sim \widehat{\omega}_m$, and for compactness we write
+
+\begin{align*}
+    \rho_y =& \rho_{yaw,lin}\\
+    \rho_p =& \rho_{pitch,lin}\\
+    \rho_r =& \rho_{roll,lin}\\
+    \{T, \tau\}_{1, 2} =& \{T, \tau\}_{lin, quad}\\
+    k_I =& k_{inertial} \\
+    k_{\beta, m} =& -\frac{1}{k_\alpha} \left(k_\omega + 2 k_{\omega^2} \widehat{\omega}_m \right)
+\end{align*}
+where $k_{\beta, m}$ is justified by the rewriting of the voltage equation on the rotors as
+\begin{equation}
+    \begin{aligned}
+     \dot{\omega}_m &= \frac{1}{k_\alpha} \left(V - k_\omega(\omega_m) - k_{\omega^2}(\omega^2)\right)\\
+     &=_{\omega_m \sim \widehat{\omega}_m} \frac{1}{k_\alpha} \left( V - \left(k_\omega + 2 k_{\omega^2}\widehat{\omega}_m\right) \omega_m + k_{\omega^2}\widehat{\omega}_m^2 \right)\\
+     &= - \frac{1}{k_\alpha} \left(k_\omega + 2 k_{\omega^2}\widehat{\omega}_m\right) \omega_m + \frac{1}{k_\alpha} \left( V + k_{\omega^2}\widehat{\omega}_m^2 \right),
+    \end{aligned}
+\end{equation}
+that is, our $k_{\beta, m}$ is the coefficient of $\omega$, where the Taylor expansion is given by the above linearization; the voltage-dependent term and the constant term also appear in the appropriate matrices.
+
+Additionally, we assume some basic symmetry in the prop arrangement and adopt the following simplification:
+
+\begin{align*}
+    D_F \coloneqq& ||\vec{D_{FL}} \times \vec{y}|| = ||\vec{D_{FR}} \times \vec{y}||\\
+    D_B \coloneqq& ||\vec{D_{BL}} \times \vec{y}|| = ||\vec{D_{BR}} \times \vec{y}||\\
+    D_L \coloneqq& ||\vec{D_{FL}} \times \vec{x}|| = ||\vec{D_{BL}} \times \vec{x}||\\
+    D_R \coloneqq& ||\vec{D_{FR}} \times \vec{x}|| = ||\vec{D_{BR}} \times \vec{x}||\\
+\end{align*}
+
+We thus define our state vector
+
+\setcounter{MaxMatrixCols}{20}
+\begin{equation}
+\begin{aligned}
+    X \coloneqq \begin{bmatrix}
+    \dot{\gamma} & \dot{\phi} & \dot{\theta} & \omega_{FL} & \omega_{FR} & \omega_{BL} & \omega_{BR}
+\end{bmatrix},
+\end{aligned}
+\end{equation}
+
+and transition matrix
+
+\begin{equation}
+\hspace{-0.7in}A \coloneqq \begin{bmatrix}
+\rho_y & 0 & 0 & 2 k_\tau \widehat{\omega}_{FL} + k_Ik_{\beta, FL} & - 2 k_\tau \widehat{\omega}_{FR} - k_Ik_{\beta, FR} & - 2 k_\tau \widehat{\omega}_{BL} - k_Ik_{\beta, BL} & 2 k_\tau \widehat{\omega}_{BR} + k_Ik_{\beta, BR}\\
+0 & \rho_p & 0 & 2 k_T D_F \hat{\omega_{FL}} & 2 k_T D_F \widehat{\omega}_{FR} & -2 k_T D_B \widehat{\omega}_{BL} & -2 k_T D_B\widehat{\omega}_{BR}\\
+0 & 0 & \rho_r & 2 k_T D_L\hat{\omega_{FL}} & -2 k_T D_R \widehat{\omega}_{FR} & 2 k_T D_L\widehat{\omega}_{BL} & -2 k_T D_R\widehat{\omega}_{BR}\\
+0 & 0 & 0 & k_{\beta, FL} & 0 & 0 & 0\\
+0 & 0 & 0 & 0 & k_{\beta, FR} & 0 & 0 &\\
+0 & 0 & 0 & 0 & 0 & k_{\beta, BL} & 0\\
+0 & 0 & 0 & 0 & 0 & 0 & k_{\beta, BR}\\
+\end{bmatrix}.\\
+\end{equation}
+
+Our Taylor expansion also leaves an affine vector term of the form
+
+\begin{equation}
+\begin{aligned} C \coloneqq 
+    \begin{bmatrix}
+        & \left(\dfrac{k_I k_{\omega^2}}{k_\alpha} - k_\tau\right) \left( \widehat{\omega}_{FL}^2 - \widehat{\omega}_{FR}^2 - \widehat{\omega}_{BL}^2 + \widehat{\omega}_{BR}^2\right)\\
+        & -k_T D_F(\widehat{\omega_{FL}}^2 + \widehat{\omega_{FR}}^2) + k_T D_B(\widehat{\omega_{BL}}^2 + \widehat{\omega_{BR}}^2)\\
+        & - k_T D_L(\widehat{\omega_{FL}}^2 + \widehat{\omega_{BL}}^2) + k_T D_R(\widehat{\omega_{FR}}^2 + \widehat{\omega_{BR}}^2)\\
+        & \dfrac{k_{\omega^2}\widehat{\omega}_{FL}^2}{k_\alpha}\\
+        & \dfrac{k_{\omega^2}\widehat{\omega}_{FR}^2}{k_\alpha}\\
+        & \dfrac{k_{\omega^2}\widehat{\omega}_{BL}^2}{k_\alpha}\\
+        & \dfrac{k_{\omega^2}\widehat{\omega}_{BR}^2}{k_\alpha}\\
+    \end{bmatrix}.
+\end{aligned} 
+\end{equation}
+
+Lastly, we define the control vector, given by
+
+\begin{equation}
+\begin{aligned}U \coloneqq 
+    \begin{bmatrix}
+        V_{FL} & V_{FR} & V_{BL} & V_{BR}
+    \end{bmatrix}
+\end{aligned} 
+\end{equation}
+
+with input matrix
+
+\begin{equation}
+\begin{aligned}B \coloneqq 
+    \begin{bmatrix}
+        \dfrac{k_I}{k_\alpha}  & -\dfrac{k_I}{k_\alpha} & -\dfrac{k_I}{k_\alpha} & \dfrac{k_I}{k_\alpha} \\
+        0 & 0 & 0 & 0\\
+        0 & 0 & 0 & 0\\
+        \frac{1}{k_\alpha} & 0 & 0 & 0\\
+        0 & \frac{1}{k_\alpha} & 0 & 0\\
+        0 & 0 & \frac{1}{k_\alpha} & 0\\
+        0 & 0 & 0 & \frac{1}{k_\alpha}\\
+    \end{bmatrix}.
+\end{aligned} 
+\end{equation}\\
+
+
+Together, the above yield our continuous-time state-space equation:
+\begin{equation}
+    \dot{X} = AX + BU + C,
+\end{equation}
+where we treat $X, U$ as column vectors as appropriate.
+
+\subsection{Closed-loop linearization}
+The affine term is cancelled by the input
+\begin{equation}
+    U_{aff} \coloneqq -B^+ C(\widehat{\omega}),
+\end{equation}
+which removes the component of $C$ in the range of $B$ (the yaw and motor rows; $B$ has no direct pitch or roll path, so those rows of $C$ are left to the integrator).  Were $\widehat{\omega}$ a fixed operating point, $U_{aff}$ would be a constant offset and the dynamics seen by the feedback would be exactly $\dot{X} = AX + BU$.  In practice, however, we evaluate the linearization at the \emph{measured} rotor speeds on every control tick, $\widehat{\omega} \coloneqq \omega$, so $U_{aff}$ is itself a function of the state, i.e.\ feedback, and it contributes to the closed-loop Jacobian.
+
+For a single rotor, the true dynamics and the linearizer give
+\begin{equation}
+\begin{aligned}
+    k_\alpha \dot{\omega}_m &= V_{lin} + V_{aff} - k_\omega(\omega_m) - k_{\omega^2}(\omega_m^2)\\
+    &= V_{lin} - k_{\omega^2}(\omega_m^2) - k_\omega(\omega_m) - k_{\omega^2}(\omega_m^2)\\
+    &= V_{lin} - k_\omega(\omega_m) - 2k_{\omega^2}(\omega_m^2),
+\end{aligned}
+\end{equation}
+which agrees with the tangent line $k_\alpha(k_{\beta,m}\,\omega_m) + V_{lin}$ in value at $\omega_m = \widehat{\omega}_m$ but has twice its curvature, and hence slope
+\begin{equation}
+    \frac{\partial \dot{\omega}_m}{\partial \omega_m} = -\frac{1}{k_\alpha}\left(k_\omega + 4k_{\omega^2}\widehat{\omega}_m\right) \neq k_{\beta, m}.
+\end{equation}
+The discrepancy is first-order in $\delta\omega_m = \omega_m - \widehat{\omega}_m$: expanding the intercept $c(\widehat{\omega}_m) = k_{\omega^2}\widehat{\omega}_m^2 / k_\alpha$ (the motor rows of $C$),
+\begin{equation}
+    c(\widehat{\omega}_m + \delta\omega_m) = c(\widehat{\omega}_m) + \underbrace{\frac{2k_{\omega^2}\widehat{\omega}_m}{k_\alpha}\delta\omega_m}_{\text{first order}} + \underbrace{\frac{k_{\omega^2}}{k_\alpha}\delta\omega_m^2}_{\text{dropped}},
+\end{equation}
+and cancelling $c$ at the moving point cancels its linear part as well.  Note that because the tangent line passes through the true dynamics at $\widehat{\omega}_m$,
+\begin{equation}
+    \frac{d}{d\widehat{\omega}_m}\left[k_{\beta,m}(\widehat{\omega}_m)\,\widehat{\omega}_m + c(\widehat{\omega}_m)\right] = k_{\beta, m}
+    \quad\Longrightarrow\quad
+    k_{\beta,m}'(\widehat{\omega}_m)\,\widehat{\omega}_m + c'(\widehat{\omega}_m) = 0,
+\end{equation}
+so for the plant alone the moving slope and moving intercept cancel, and $A$ is its true Jacobian; it is removing only the intercept that leaves the residual $-c'$.
+
+In matrix form, the closed loop is $\dot{X} = f(X) + BU_{lin} - BB^+C(\omega)$, with Jacobian
+\begin{equation}
+    A_{eff} \coloneqq A - BB^+\frac{\partial C}{\partial \omega}\bigg|_{\widehat{\omega}}
+    = A + B\,G\,\mathrm{diag}\left(2|\widehat{\omega}_m|\right),
+    \qquad G \coloneqq -B^+ P,\quad C = P\,[\widehat{\omega}_m|\widehat{\omega}_m|].
+\end{equation}
+$BB^+$ leaves the pitch and roll rows untouched, passes the motor rows, and carries them into the yaw row through $k_I$.  To within the least-squares share of the $-k_\tau$ yaw residual (of order $10^{-5}$ relative), $G = -k_{\omega^2}I$, and the correction amounts to the substitution
+\begin{equation}
+    k_{\beta, m} \;\to\; \tilde{k}_{\beta, m} \coloneqq -\frac{1}{k_\alpha}\left(k_\omega + 4 k_{\omega^2}\widehat{\omega}_m\right)
+\end{equation}
+wherever $k_{\beta, m}$ appears in $A$ (the motor diagonal and the $k_I k_{\beta, m}$ terms of the yaw row).  The gains, the integral bound and the feedforward reference model are all designed on $A_{eff}$.
+
+
+\end{document}
