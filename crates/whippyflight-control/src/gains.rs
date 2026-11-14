@@ -400,9 +400,11 @@ pub trait TableEntry: bytemuck::Pod + Default + Add<Output = Self> + Mul<f32, Ou
 
 impl<T: bytemuck::Pod + Default + Add<Output = T> + Mul<f32, Output = T>> TableEntry for T {}
 
-/// A quantized lookup table read in place from the blob, `lo.len()` values
-/// per grid point, indexed [grid point] · width + slot:
-/// value[i] = lo[i % W] + step[i % W] · q[i].
+/// A quantized lookup table read in place from the blob.
+///
+/// Each grid point has a row of `W = lo.len()` slots, stored as `u16`
+/// codes: slot `s` of the row at grid point `p` is
+/// `lo[s] + step[s] · q[p·W + s]`, each slot with its own range.
 #[derive(Clone, Copy)]
 pub struct GainTable<E: 'static> {
     q: &'static [u16],
@@ -432,23 +434,34 @@ impl<E: TableEntry> GainTable<E> {
         self.lo[slot] + self.step[slot] * self.q[i] as f32
     }
 
-    /// Weighted sum over grid points of the `W` values at each, i.e.
-    /// Σ_v weight[v] · table[point[v]·W + i].  The weights must sum to 1:
-    /// the raw codes are summed and lo/step applied once per slot.
-    pub fn blend<const W: usize>(&self, point: &[usize], weight: &[f32]) -> [E; W] {
-        self.blend_slots::<W>(W, 0, point, weight)
+    /// The weighted average of the rows at `points`: slot `s` is
+    /// Σ_v weights[v] · value(points[v], s).
+    ///
+    /// `weights` must sum to 1.  Decoding is affine, so the average of the
+    /// decoded values is the decoded average of the codes:
+    /// Σ w·(lo + step·q) = lo + step·Σ w·q.  The codes are averaged and
+    /// decoded once per slot, rather than once per slot per point.
+    pub fn blend<const W: usize>(&self, points: &[usize], weights: &[f32]) -> [E; W] {
+        self.blend_slots::<W>(W, 0, points, weights)
     }
 
-    /// [`Self::blend`] of the `K` slots from `first` in rows of `width`.
-    pub fn blend_slots<const K: usize>(&self, width: usize, first: usize, point: &[usize], weight: &[f32]) -> [E; K] {
-        let mut code = [0.0f32; K];
-        for (&p, &w) in point.iter().zip(weight) {
-            let row = &self.q[p * width + first..p * width + first + K];
-            for (o, &x) in code.iter_mut().zip(row) {
-                *o += w * x as f32;
+    /// [`Self::blend`] of only slots `first..first + K` of each row, for a
+    /// table whose rows (`width` slots each) hold several independent blocks.
+    pub fn blend_slots<const K: usize>(
+        &self,
+        width: usize,
+        first: usize,
+        points: &[usize],
+        weights: &[f32],
+    ) -> [E; K] {
+        let mut q_avg = [0.0f32; K];
+        for (&point, &weight) in points.iter().zip(weights) {
+            let start = point * width + first;
+            for (avg, &q) in q_avg.iter_mut().zip(&self.q[start..start + K]) {
+                *avg += weight * q as f32;
             }
         }
-        core::array::from_fn(|i| self.lo[first + i] + self.step[first + i] * code[i])
+        core::array::from_fn(|k| self.lo[first + k] + self.step[first + k] * q_avg[k])
     }
 }
 

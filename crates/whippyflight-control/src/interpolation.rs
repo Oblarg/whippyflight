@@ -39,34 +39,37 @@ impl InterpolatedGains {
     }
 }
 
-/// The 16 hypercube vertices around an operating point: grid-point index
-/// and multilinear weight.
+/// The 16 corners of the grid cell around an operating point, as flat
+/// grid-point indices and multilinear weights.
 struct Vertices {
-    flat: [usize; 16],
-    weight: [f32; 16],
+    points: [usize; 16],
+    weights: [f32; 16],
 }
 
 impl Vertices {
-    fn new(n: usize, floor_idx: &[usize; 4], frac: &[f32; 4]) -> Self {
-        let mut flat = [0usize; 16];
-        let mut weight = [0.0f32; 16];
-        for vertex in 0..16usize {
+    /// Bit m of the corner number picks motor m's lower (0) or upper (1)
+    /// grid index; the corner's weight is the product over motors of
+    /// `1 − frac` or `frac` respectively, so the weights sum to 1.
+    fn new(n: usize, lower: &[usize; 4], frac: &[f32; 4]) -> Self {
+        let mut points = [0usize; 16];
+        let mut weights = [0.0f32; 16];
+        for corner in 0..16usize {
             let mut idx = [0usize; 4];
-            let mut w = 1.0f32;
+            let mut weight = 1.0f32;
             for m in 0..4 {
-                let bit = (vertex >> m) & 1;
-                idx[m] = floor_idx[m] + bit;
-                w *= if bit == 0 { 1.0 - frac[m] } else { frac[m] };
+                let upper = (corner >> m) & 1 == 1;
+                idx[m] = lower[m] + upper as usize;
+                weight *= if upper { frac[m] } else { 1.0 - frac[m] };
             }
-            flat[vertex] = ((idx[0] * n + idx[1]) * n + idx[2]) * n + idx[3];
-            weight[vertex] = w;
+            points[corner] = ((idx[0] * n + idx[1]) * n + idx[2]) * n + idx[3];
+            weights[corner] = weight;
         }
-        Self { flat, weight }
+        Self { points, weights }
     }
 
-    /// Weighted sum of a table with `W` values per grid point.
+    /// A table's rows (`W` slots each) interpolated at the operating point.
     fn interpolate<E: TableEntry, const W: usize>(&self, table: &GainTable<E>) -> [E; W] {
-        table.blend::<W>(&self.flat, &self.weight)
+        table.blend::<W>(&self.points, &self.weights)
     }
 }
 
@@ -87,37 +90,41 @@ pub fn interpolate_gains(
     let header = &storage.header;
     let n = header.resolution as usize;
     let step = (header.max_rps - header.min_rps) / (n as f32 - 1.0);
-    let max_idx = n - 1;
 
-    let mut floor_idx = [0usize; 4];
+    // Each motor's position on the grid: the cell's lower index and the
+    // fraction of the way to the upper one.  Speeds off the grid clamp to
+    // its edge, and the top grid point is the last cell at frac = 1.
+    let mut lower = [0usize; 4];
     let mut frac = [0.0f32; 4];
-
     for m in 0..4 {
         let clamped = motor_rps[m].clamp(header.min_rps, header.max_rps);
-        let continuous_idx: f32 = ((clamped - header.min_rps) / step).into();
-        let fi = continuous_idx as usize;
-        floor_idx[m] = if fi >= max_idx { max_idx - 1 } else { fi };
-        frac[m] = continuous_idx - floor_idx[m] as f32;
+        let position: f32 = ((clamped - header.min_rps) / step).into();
+        lower[m] = (position as usize).min(n - 2);
+        frac[m] = position - lower[m] as f32;
     }
 
-    let vertices = Vertices::new(n, &floor_idx, &frac);
+    let vertices = Vertices::new(n, &lower, &frac);
 
     InterpolatedGains {
         ki: interpolate_4x3!(vertices, storage.ki),
         kd: interpolate_4x3!(vertices, storage.kd),
         kp: interpolate_4x3!(vertices, storage.kp),
         binv: interpolate_4x3!(vertices, storage.binv),
-        ref_model: ReferenceModel::from_slots(&reference_model(storage, &floor_idx, &frac)),
+        ref_model: ReferenceModel::from_slots(&reference_model(storage, &lower, &frac)),
     }
 }
 
 /// The reference model: each motor's slots interpolated along its own speed.
-fn reference_model(storage: &GainStorage, floor_idx: &[usize; 4], frac: &[f32; 4]) -> [f32; REF_FLOATS] {
+///
+/// The table's row at grid index i holds every motor's slots at speed i,
+/// motor m's at `m · REF_MOTOR_SLOTS`, so motor m interpolates its block
+/// between the rows at its lower and upper index.
+fn reference_model(storage: &GainStorage, lower: &[usize; 4], frac: &[f32; 4]) -> [f32; REF_FLOATS] {
     let motors = core::array::from_fn(|m| {
         storage.ref_model.blend_slots::<REF_MOTOR_SLOTS>(
             REF_MOTOR_WIDTH,
             m * REF_MOTOR_SLOTS,
-            &[floor_idx[m], floor_idx[m] + 1],
+            &[lower[m], lower[m] + 1],
             &[1.0 - frac[m], frac[m]],
         )
     });
