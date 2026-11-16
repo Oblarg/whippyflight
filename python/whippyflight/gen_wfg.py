@@ -33,7 +33,7 @@ from whippyflight import coefficients
 
 # ── .wfg format constants ────────────────────────────────────────────────
 MAGIC       = 0x4C515247   # "LQRG" little-endian
-VERSION     = 9
+VERSION     = 10
 HEADER_SIZE = 0x20
 
 # Reference-model table, per grid point (FRD axes, motors by index):
@@ -45,15 +45,17 @@ REF_LAYOUT = [          # (name, rows, cols); diagonal blocks stored as vectors
     ('bd_w',  4, 1),    # one-tick motor speed ← voltage
     ('fh_rr', 3, 1),    # h-tick free response, rate ← rate
     ('fh_rw', 3, 4),    # h-tick free response, rate ← motor speed
+    ('gh',    3, 4),    # h-tick forced response, rate ← voltage held (G_h)
 ]
 REF_FLOATS = sum(r * c for _, r, c in REF_LAYOUT)
 # The blob stores the speed-free slots once and the rest per motor: each
 # depends on one motor's speed only (gains.rs REF_MOTOR_SLOTS), as
-# ref slots [ad_rw[:, m], ad_ww[m], bd_r[:, m], bd_w[m], fh_rw[:, m]].
+# ref slots [ad_rw[:, m], ad_ww[m], bd_r[:, m], bd_w[m], fh_rw[:, m], gh[:, m]].
 REF_CONST_SLOTS = [0, 1, 2, 35, 36, 37]
 REF_MOTOR_SLOTS = [[3 + 4 * i + m for i in range(3)] + [15 + m]
                    + [19 + 4 * i + m for i in range(3)] + [31 + m]
-                   + [38 + 4 * i + m for i in range(3)] for m in range(4)]
+                   + [38 + 4 * i + m for i in range(3)]
+                   + [50 + 4 * i + m for i in range(3)] for m in range(4)]
 
 # ── Motor / axis conventions ─────────────────────────────────────────────
 #
@@ -312,6 +314,21 @@ def build_thrust_balance(w):
     return list(b / np.exp(np.log(b).mean()))
 
 
+def build_thrust_torque(coeffs, w, perm):
+    """
+    Roll and pitch angular acceleration per signed squared speed of each
+    motor (rot/s² per (rev/s)², FRD [roll row, pitch row], by firmware
+    motor): A's roll and pitch rows over 2ω.  The controller corrects its
+    linear reference model with them for the curvature of thrust
+    (controller.rs, "Thrust curvature").
+    """
+    k_T_pitch = coeffs['pitch']['propVelSumSq']
+    k_T_roll = coeffs['roll']['propVelSumSq']
+    pitch = k_T_pitch * np.array([w['front'], -w['back'], w['front'], -w['back']])
+    roll = k_T_roll * np.array([w['left'], w['left'], -w['right'], -w['right']])
+    return np.concatenate([to_firmware_motors(roll, perm), to_firmware_motors(pitch, perm)])
+
+
 def build_airframe_drag(coeffs):
     """
     Airframe drag block [lp_hz, roll←accX, roll←accY, pitch←accX, pitch←accY]
@@ -392,7 +409,11 @@ def feedforward_model(Ad, Bd, horizon):
     one tick at a time by δx ← Ad·δx + Bd·u_ff.  A one-tick horizon leaves a
     sampling zero near −1 (Nyquist chatter in u); h ≥ 2 removes it.
 
-    Returns (binv [4,3], ref [REF_FLOATS]) with ref packed as REF_LAYOUT.
+    The blob carries G_h, whose column m follows motor m's speed alone, and
+    the firmware inverts it per tick: G_h⁺ goes as 1/ω, which interpolates
+    poorly on a coarse grid; G_h is nearly linear in ω.
+
+    Returns (G_h⁺ [4,3], for display, and ref [REF_FLOATS] packed as REF_LAYOUT).
     """
     G = sum(np.linalg.matrix_power(Ad, i) @ Bd for i in range(horizon))[:3]
     F = np.linalg.matrix_power(Ad, horizon)[:3]
@@ -406,6 +427,7 @@ def feedforward_model(Ad, Bd, horizon):
         np.diag(Bd[3:]),                # bd_w   [4]
         np.diag(F[:, :3]),              # fh_rr  [3]
         F[:, 3:].ravel(),               # fh_rw  [3×4]
+        G.ravel(),                      # gh     [3×4]
     ])
     assert ref.size == REF_FLOATS
     return np.linalg.pinv(G), ref
@@ -562,7 +584,7 @@ def solve_gain_grid(coeffs, w, resolution, min_rps, max_rps, dt, tau_int, tau_de
       ki_py  [N,N,N,N, 4, 3]   integral gains (V / rot)
       kd_py  [N,N,N,N, 4, 3]   derivative gains (V / (rot/s²))
       kp_py  [N,N,N,N, 4, 3]   proportional gains (V / (rot/s))
-      binv_py[N,N,N,N, 4, 3]   horizon feedforward inverse G_h⁺ (V / (rot/s))
+      binv_py[N,N,N,N, 4, 3]   horizon feedforward inverse G_h⁺ (V / (rot/s)), for display
       ref_py [N,N,N,N, REF_FLOATS]  reference-model terms (REF_LAYOUT)
     """
     N = resolution
@@ -677,7 +699,7 @@ def crc32(data: bytes) -> int:
 
 def split_ref_by_motor(ref_flat, resolution):
     """The flat N⁴ reference-model table as (speed-free slots [6], per-motor
-    table [N, 4, 11] flattened), checking it depends on each motor alone."""
+    table [N, 4, 14] flattened), checking it depends on each motor alone."""
     N = resolution
     ref = np.asarray(ref_flat, dtype=np.float64).reshape([N] * 4 + [REF_FLOATS])
     origin = ref[0, 0, 0, 0]
@@ -709,21 +731,21 @@ def quantize_table(flat, width):
     return lo, step, q.reshape(-1)
 
 
-def pack_wfg(ki_flat, kd_flat, kp_flat, binv_flat, ref_flat, affine_g, motor_drag,
+def pack_wfg(ki_flat, kd_flat, kp_flat, ref_flat, affine_g, motor_drag,
              thrust_balance, resolution, min_rps, max_rps, dt, tau_int, tau_deriv, ff_horizon,
              layout, airframe_drag=(0.0,) * 5, target_limits=(0.0, 0.0), hover_rps=0.0,
-             integral_limit_v=0.0):
+             integral_limit_v=0.0, thrust_torque=(0.0,) * 8):
     """Pack gain tables, reference model, affine linearizer, motor drag,
     thrust balance, airframe drag, target limits, hover speed, integral
-    voltage bound and motor layout into .wfg, all by firmware motor.
+    voltage bound, thrust torque and motor layout into .wfg, all by firmware motor.
     `layout` is (slot per motor, spin code per motor), coefficients.layout."""
     ref_const, ref_motor = split_ref_by_motor(ref_flat, resolution)
-    widths = [12, 12, 12, 12, 4 * len(REF_MOTOR_SLOTS[0])]
+    widths = [12, 12, 12, 4 * len(REF_MOTOR_SLOTS[0])]
     quantized = [quantize_table(flat, w)
-                 for flat, w in zip([ki_flat, kd_flat, kp_flat, binv_flat, ref_motor], widths)]
+                 for flat, w in zip([ki_flat, kd_flat, kp_flat, ref_motor], widths)]
     tables_bytes = b''
     for k, (lo, step, _) in enumerate(quantized):
-        if k == 4:
+        if k == 3:
             tables_bytes += ref_const.astype('<f4').tobytes()
         tables_bytes += lo.astype('<f4').tobytes() + step.astype('<f4').tobytes()
     affine_flat = np.asarray(affine_g, dtype=np.float32).reshape(16)
@@ -733,6 +755,7 @@ def pack_wfg(ki_flat, kd_flat, kp_flat, binv_flat, ref_flat, affine_g, motor_dra
     tables_bytes += struct.pack('<5f', *airframe_drag)
     tables_bytes += struct.pack('<2f', *target_limits)
     tables_bytes += struct.pack('<2f', hover_rps, integral_limit_v)
+    tables_bytes += struct.pack('<8f', *thrust_torque)
     positions, spins = layout
     tables_bytes += struct.pack('<4B', *positions) + struct.pack('<4B', *spins)
     for _, _, q in quantized:
@@ -881,7 +904,6 @@ def generate(args):
     ki_flat   = to_firmware_table(ki_py * s, perm)
     kd_flat   = to_firmware_table(kd_py * s, perm)
     kp_flat   = to_firmware_table(kp_py * s, perm)
-    binv_flat = to_firmware_table(binv_py, perm)
     ref_flat  = to_firmware_ref(ref_py, perm)
 
     affine_g = build_affine_linearizer(coeffs, w)
@@ -899,11 +921,12 @@ def generate(args):
           f"({TRIM_CG_ARM_FRACTION:.0%}-of-arm CG offset)", file=sys.stderr)
 
     print("Packing .wfg binary...", file=sys.stderr)
-    blob = pack_wfg(ki_flat, kd_flat, kp_flat, binv_flat, ref_flat,
+    blob = pack_wfg(ki_flat, kd_flat, kp_flat, ref_flat,
                     to_firmware_motors(affine_g, perm), motor_drag, thrust_balance,
                     args.resolution, args.min_rps, args.max_rps,
                     args.dt, args.tau_int, args.tau_deriv, args.ff_horizon,
-                    (perm, spins), airframe_drag, target_limits, hover_rps, integral_limit_v)
+                    (perm, spins), airframe_drag, target_limits, hover_rps, integral_limit_v,
+                    build_thrust_torque(coeffs, w, perm))
     return blob, (ki_py, kd_py, kp_py, binv_py, affine_g)
 
 

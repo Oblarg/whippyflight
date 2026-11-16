@@ -102,7 +102,7 @@ DT = struct.unpack_from("<f", _blob, 0x10)[0]
 # The blob's motor layout block (gains.rs LAYOUT_OFFSET: 4 positions, then
 # 4 spins, 0 = CW) must be what BF's quad X mixer drives: props out is
 # yaw_motors_reversed.
-LAYOUT_OFFSET = 0x394
+LAYOUT_OFFSET = 0x3B4
 SPINS = slice(LAYOUT_OFFSET + 4, LAYOUT_OFFSET + 8)
 YAW_MOTORS_REVERSED = tuple(_blob[SPINS]) == (1, 0, 0, 1)
 RC_EVERY = round(0.002 / DT)

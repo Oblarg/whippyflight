@@ -37,7 +37,6 @@ fn make_gradient_blob() -> Vec<u8> {
     gradient_table(&mut spec.ki, n, 0.0);
     gradient_table(&mut spec.kd, n, 100.0);
     gradient_table(&mut spec.kp, n, 200.0);
-    gradient_table(&mut spec.binv, n, 300.0);
     for g in 0..n {
         for m in 0..4 {
             spec.ref_motor[g * REF_MOTOR_WIDTH + m * REF_MOTOR_SLOTS + 7] = (1 + m + 10 * g) as f32;
@@ -136,16 +135,13 @@ fn interpolation_distinguishes_tables() {
     // ki (base=0):   0.0
     // kd (base=100): 100.0
     // kp (base=200): 200.0
-    // binv (base=300): 300.0
     let ki = interp.ki.as_uniform().get(0, 0);
     let kd = interp.kd.as_uniform().get(0, 0);
     let kp = interp.kp.as_uniform().get(0, 0);
-    let binv = interp.binv.as_uniform().get(0, 0);
 
     assert!((ki - VoltPerRot::new(0.0)).abs() < VoltPerRot::new(1e-4));
     assert!((kd - VoltPerRpsPerSec::new(100.0)).abs() < VoltPerRpsPerSec::new(1e-4));
     assert!((kp - VoltPerRps::new(200.0)).abs() < VoltPerRps::new(1e-4));
-    assert!((binv - VoltPerRps::new(300.0)).abs() < VoltPerRps::new(1e-4));
 }
 
 #[test]
@@ -181,4 +177,55 @@ fn reference_model_follows_each_motors_own_speed() {
     }
     // The speed-free blocks come through as stored.
     assert_eq!(interp.ref_model.ad_rr, [1.0; 3]);
+}
+
+#[test]
+fn horizon_inverse_is_the_least_norm_inverse_of_the_interpolated_gh() {
+    // gh[i][m] = (i == m ? 2 : 0.3·(i + 1)) · (1 + grid index): motor 3 drives
+    // every axis, so the inverse spreads over all four motors.
+    let n = 2usize;
+    let mut spec = BlobSpec::new(n as u8);
+    spec.max_rps = 200.0;
+    for g in 0..n {
+        for m in 0..4 {
+            for i in 0..3 {
+                let v = if i == m { 2.0 } else { 0.3 * (i + 1) as f32 };
+                spec.ref_motor[g * REF_MOTOR_WIDTH + m * REF_MOTOR_SLOTS + 11 + i] = v * (1 + g) as f32;
+            }
+        }
+    }
+    let blob = spec.encode();
+    let mut storage = GainStorage::new();
+    assert_eq!(load_gains(common::static_blob(&blob), &mut storage), GainLoadResult::Ok);
+
+    let interp = interpolate_gains(&[100.0, 200.0, 150.0, 125.0].map(RotPerSec::new), &storage);
+    let gh = |i, m| interp.ref_model.gh.as_uniform().get(i, m).unsafe_value;
+    let binv = |m, i| interp.binv.as_uniform().get(m, i).unsafe_value;
+    assert!((gh(1, 1) - 4.0).abs() < 1e-3, "gh follows motor 1's speed: {}", gh(1, 1));
+
+    // G·G⁺ = I, and G⁺·G is symmetric (G⁺ lies in G's row space).
+    for i in 0..3 {
+        for k in 0..3 {
+            let p: f32 = (0..4).map(|m| gh(i, m) * binv(m, k)).sum();
+            let want = if i == k { 1.0 } else { 0.0 };
+            assert!((p - want).abs() < 1e-4, "(G·G⁺)[{i}][{k}] = {p}");
+        }
+    }
+    for a in 0..4 {
+        for b in 0..4 {
+            let pab: f32 = (0..3).map(|i| binv(a, i) * gh(i, b)).sum();
+            let pba: f32 = (0..3).map(|i| binv(b, i) * gh(i, a)).sum();
+            assert!((pab - pba).abs() < 1e-4, "(G⁺·G)[{a}][{b}] = {pab}, [{b}][{a}] = {pba}");
+        }
+    }
+}
+
+#[test]
+fn horizon_inverse_is_zero_without_a_reference_model() {
+    let interp = interpolate_gains(&[RotPerSec::new(150.0); 4], &load_gradient_gains());
+    for m in 0..4 {
+        for i in 0..3 {
+            assert_eq!(interp.binv.as_uniform().get(m, i), VoltPerRps::new(0.0));
+        }
+    }
 }

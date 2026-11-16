@@ -50,6 +50,11 @@ between flights, and across flights the drag terms absorb that instead.
 The JSON's "drag" block records the axes kept; gen_wfg packs it into the
 v7 blob, and firmware built with the airframe-drag feature compensates it.
 
+The motor model V = motorAccel·ω̇ + motorVel·ω + motorVelSq·ω|ω| is fitted by
+output error (fit_motors), which also finds the voltage-to-telemetry delay;
+the JSON's "latency" block gives ACTUATOR_TICKS of it to the motors and the
+rest to the telemetry.  --select r regresses it as main.R did.
+
 `validate` reports per log and axis the R² of given coefficients on that
 log's rows next to the R² of a fit to that log alone.  `crossval` is
 leave-one-out within one airframe: each flight is scored by a fit to the
@@ -80,6 +85,7 @@ from whippyflight import coefficients
 from whippyflight_betaflight.bbl import read_logs
 
 AXES = ("yaw", "pitch", "roll", "motors")
+MOTOR_NAMES = ("motorVel", "motorVelSq", "motorAccel")
 
 # main.R's windows, in samples of the Meteor65 log it was tuned on (1609 Hz).
 R_WINDOW = {"yaw": 50, "pitch": 20, "roll": 20, "motors": 16}
@@ -318,6 +324,80 @@ def load_flights(spec, selection="robust", motor_poles=None):
     return flights
 
 
+def modeled_speeds(flight, motor_coeffs, volts_map, delay_s=0.0):
+    """
+    Motor shaft speeds (rev/s; FL, BL, FR, BR as `Flight.motors`) the fitted
+    motor model reaches from the logged voltages, `delay_s` late (to line up
+    with the telemetry), restarting from the logged speeds wherever a usable
+    stretch begins: the speeds without telemetry noise.
+    """
+    k = [motor_coeffs[n] for n in MOTOR_NAMES]
+    seg = _MotorRun(flight, volts_map)
+    return tuple(seg.simulate(k, round(delay_s * flight.log_hz)).T)
+
+
+class _MotorRun:
+    """A flight's voltages and speed telemetry (samples × FL, BL, FR, BR) for simulating its motors."""
+
+    def __init__(self, flight, volts_map):
+        self.volts = np.column_stack(flight.volts(volts_map))
+        self.measured = np.column_stack(flight.motors())
+        self.good = flight.good
+        self.restart = np.concatenate([[True], flight.good[1:] & ~flight.good[:-1]])
+        self.dt = np.diff(flight.t, prepend=flight.t[0])
+
+    def simulate(self, k, delay):
+        """
+        Euler steps of V = k_acc·ω̇ + k_vel·ω + k_sq·ω|ω| from the voltages `delay`
+        samples late, restarting from the telemetry wherever a usable stretch begins.
+        """
+        k_vel, k_sq, k_acc = k
+        volts = np.concatenate([np.repeat(self.volts[:1], delay, axis=0), self.volts[:-delay]]) \
+            if delay > 0 else self.volts
+        speeds = np.empty_like(self.measured)
+        w = self.measured[0]
+        for i in range(len(self.dt)):
+            if self.restart[i]:
+                w = self.measured[i]
+            else:
+                w = w + (volts[i - 1] - k_vel * w - k_sq * w * np.abs(w)) / k_acc * self.dt[i]
+            speeds[i] = w
+        return speeds
+
+    def error(self, k, delay):
+        """Simulated minus telemetry speeds over the usable rows."""
+        return (self.simulate(k, delay) - self.measured)[self.good].ravel()
+
+
+def voltage_delay(coeffs):
+    """The fit's voltage-to-telemetry delay (s); 0 for fits from before it was measured."""
+    return 1e-3 * (coeffs.get("latency") or {}).get("voltage_to_telemetry_ms", 0.0)
+
+
+def with_voltage_delay(flight, delay_s):
+    """`flight` with its voltages `delay_s` late (whole samples, the first held): what the telemetry answers."""
+    n = round(delay_s * flight.log_hz)
+    if n <= 0:
+        return flight
+    out = copy.copy(flight)
+    volts = flight.volts
+    out.volts = lambda mapping: tuple(np.concatenate([np.full(n, x[0]), x[:-n]]) for x in volts(mapping))
+    return out
+
+
+def actuator_delay(coeffs):
+    """The fit's voltage-to-motor delay (s): when the airframe feels a command; 0 for fits from before it was measured."""
+    return 1e-3 * (coeffs.get("latency") or {}).get("actuator_ms", 0.0)
+
+
+def with_modeled_speeds(flight, coeffs, volts_map):
+    """`flight` with `modeled_speeds` for its motor speeds, as the airframe feels them (the telemetry's come later)."""
+    clean = copy.copy(flight)
+    speeds = modeled_speeds(flight, coeffs["motors"], volts_map, actuator_delay(coeffs))
+    clean.motors = lambda: speeds
+    return clean
+
+
 def _sq(x):
     return np.sign(x) * x * x
 
@@ -336,10 +416,10 @@ def _rows_ok(good, n):
     return (bad[n + 1:] - bad[:-n - 1]) == 0
 
 
-def _gate(flight, gate, threshold, n):
-    """Row mask: window usable and |gate| above threshold × excitation scale."""
+def _gate(flight, gate, threshold, n, gated=True):
+    """Row mask: window usable and, if `gated`, |gate| above threshold × excitation scale."""
     ok = _rows_ok(flight.good, n)
-    if not ok.any():
+    if not gated or not ok.any():
         return ok
     if flight.selection == "r":
         scale = np.abs(gate).max()
@@ -348,9 +428,13 @@ def _gate(flight, gate, threshold, n):
     return ok & (np.abs(gate) > scale * threshold)
 
 
-def design(flight, axis, arms, volts_map, drag=()):
-    """Regression rows (X, y), regressor names, and each row's sample index."""
-    n = flight.window(axis)
+def design(flight, axis, arms, volts_map, drag=(), gated=True, window=None):
+    """
+    Regression rows (X, y), regressor names, and each row's sample index.
+    Rate axes keep only excited rows unless `gated` is False: then every usable one.
+    `window` replaces the axis's finite-difference window (samples, even).
+    """
+    n = window or flight.window(axis)
     thr = THRESHOLD[axis]
     t = flight.t
     fl, bl, fr, br = flight.motors()
@@ -364,11 +448,11 @@ def design(flight, axis, arms, volts_map, drag=()):
             -_cfd(fl, t, n) + _cfd(fr, t, n) + _cfd(bl, t, n) - _cfd(br, t, n),
         ])
         y = _cfd(rate, t, n)
-        keep = _gate(flight, X[:, 0], thr, n)
+        keep = _gate(flight, X[:, 0], thr, n, gated)
         return X[keep], y[keep], ["yawRate", "propVelSumSq", "propAccelSum"], center[keep]
 
     if axis in ("pitch", "roll"):
-        X, y, names, idx = design_split(flight, axis, axis in drag)
+        X, y, names, idx = design_split(flight, axis, axis in drag, gated, window)
         pos, neg = ARM_KEYS[axis]
         X = np.column_stack([X[:, 0], arm_regressor(X, arms[pos], arms[neg]), X[:, 3:]])
         return X, y, names[:1] + ["propVelSumSq"] + names[3:], idx
@@ -393,13 +477,13 @@ ARM_KEYS = {"pitch": ("dFront", "dBack"), "roll": ("dRight", "dLeft")}
 PHYSICAL_ARM = {"dFront": "dBack", "dBack": "dFront", "dLeft": "dRight", "dRight": "dLeft"}
 
 
-def design_split(flight, axis, drag=False):
+def design_split(flight, axis, drag=False, gated=True, window=None):
     """
     Pitch/roll rows with the two motor pairs as separate regressors:
     columns [rate, Σω²(positive pair), Σω²(negative pair)], then with `drag`
     the low-passed body x/y specific force (m/s²).
     """
-    n = flight.window(axis)
+    n = window or flight.window(axis)
     t = flight.t
     fl, bl, fr, br = flight.motors()
     if axis == "pitch":
@@ -414,7 +498,7 @@ def design_split(flight, axis, drag=False):
         X = np.column_stack([X] + [_trunc(a, n) for a in flight.accel_lp()])
         names += DRAG_TERMS
     y = _cfd(rate, t, n)
-    keep = _gate(flight, X[:, 0], THRESHOLD[axis], n)
+    keep = _gate(flight, X[:, 0], THRESHOLD[axis], n, gated)
     center = np.arange(len(t) - n) + n // 2 - 1
     return X[keep], y[keep], names, center[keep]
 
@@ -637,12 +721,96 @@ def fit_arms(flights, arms, verbose=False, drag=()):
     return arms, stats
 
 
+# The longest voltage-to-telemetry delay the motor fit tries, seconds.
+MOTOR_DELAY_SCAN_S = 0.010
+# Loop ticks between a motor command and the ESC acting on it (the DShot
+# frame and the ESC's PWM update).  The fit sees only the whole voltage-to-
+# telemetry delay; the split rests on the gyro path's delay (filters, notches
+# that move, the gyro's own anti-alias filter), which the log doesn't pin.
+ACTUATOR_TICKS = 1
+
+
+def loop_period(flights):
+    """The PID loop's period (s) from the log header; None without one."""
+    h = next((f.header for f in flights if f.header), {})
+    looptime = int(h.get("looptime", 0))
+    return looptime * int(h.get("pid_process_denom", 1)) * 1e-6 if looptime else None
+
+
+def fit_motors(flights, volts_map, arms, drag=()):
+    """
+    The motor model by output error: the coefficients whose simulated speeds,
+    from the voltages `delay` samples late, best match the telemetry, over
+    whole-sample delays up to MOTOR_DELAY_SCAN_S.  Regressing voltage on a
+    differenced speed biases motorAccel low (the noisy derivative is a
+    regressor); simulating differences nothing.  Starts from that regression.
+    Returns (coefficients, stats, voltage-to-telemetry delay in s, at scan edge).
+    """
+    from scipy.optimize import least_squares
+
+    runs = [_MotorRun(f, volts_map) for f in flights]
+    X, y, _ = stack(flights, "motors", arms, volts_map, drag)
+    k_vel, k_sq, k_acc = np.linalg.lstsq(X, y, rcond=None)[0]
+    # motorAccel as a log keeps the model's time constant positive.
+    unpack = lambda q: (q[0], q[1], math.exp(q[2]))
+    q = np.array([k_vel, k_sq, math.log(k_acc)])
+    hz = max(f.log_hz for f in flights)
+    cost, fits = {}, {}
+    n, best = 0, 0
+    while n <= round(MOTOR_DELAY_SCAN_S * hz):
+        sol = least_squares(lambda q: np.concatenate([r.error(unpack(q), n) for r in runs]),
+                            q, x_scale="jac", method="lm")
+        cost[n], fits[n], q = float(sol.fun @ sol.fun), sol, sol.x
+        best = min(cost, key=cost.get)
+        if n >= best + 2:
+            break
+        n += 1
+    at_edge = best == max(cost)
+    sol = fits[best]
+    k = unpack(sol.x)
+    shift = 0.0
+    if best - 1 in cost and best + 1 in cost:
+        a, b, c = cost[best - 1], cost[best], cost[best + 1]
+        if a - 2 * b + c > 0:
+            shift = 0.5 * (a - c) / (a - 2 * b + c)
+    rows = len(sol.fun)
+    cov = sol.fun @ sol.fun / max(rows - 3, 1) * np.linalg.inv(sol.jac.T @ sol.jac)
+    se = np.sqrt(np.diag(cov)) * np.array([1.0, 1.0, k[2]])
+    measured = np.concatenate([r.measured[r.good].ravel() for r in runs])
+    rsq = 1.0 - cost[best] / float(((measured - measured.mean()) ** 2).sum())
+    coeffs = dict(zip(MOTOR_NAMES, map(float, k)))
+    stats = {"r2": round(rsq, 4), "rows": rows, "method": "output error",
+             "rel_se": {n: round(float(s / abs(v)), 5) for (n, v), s in zip(coeffs.items(), se)}}
+    return coeffs, stats, (best + shift) / hz, at_edge
+
+
+def latency(total_s, loop_s):
+    """The voltage-to-telemetry delay split: ACTUATOR_TICKS loop ticks for the motors, the rest the telemetry's."""
+    actuator = min(total_s, ACTUATOR_TICKS * (loop_s or 0.0))
+    return {"actuator_ms": round(1e3 * actuator, 2), "telemetry_ms": round(1e3 * (total_s - actuator), 2),
+            "voltage_to_telemetry_ms": round(1e3 * total_s, 2)}
+
+
 def fit_coeffs(flights, arms, volts_map, verbose=False, drag=()):
     """Pooled fit over `flights`; returns the gen_wfg JSON dict (sans airframe)."""
     arms, arm_stats = fit_arms(flights, arms, verbose, drag)
     out = {"motor_speed": MOTOR_SPEED_UNIT}
     fit_stats = {}
+    # main.R regressed the motors; --select r keeps that.
+    output_error = flights[0].selection != "r"
     for axis in AXES:
+        if axis == "motors" and output_error:
+            out[axis], fit_stats[axis], total, at_edge = fit_motors(flights, volts_map, arms, drag)
+            out["latency"] = latency(total, loop_period(flights))
+            if at_edge:
+                print("warning: the voltage-to-telemetry delay is at the edge of its scan; the latency is unreliable",
+                      file=sys.stderr)
+            if verbose:
+                s = fit_stats[axis]
+                print(f"{axis:7s} R²={s['r2']:.4f} n={s['rows']:7d}  " +
+                      "  ".join(f"{n}={out[axis][n]:.6g}±{s['rel_se'][n] * 100:.2f}%" for n in MOTOR_NAMES) +
+                      "  (output error, speeds)")
+            continue
         X, y, names = stack(flights, axis, arms, volts_map, drag)
         beta, se, rsq = ols(X, y)
         out[axis] = {n: float(b) for n, b in zip(names, beta)}
@@ -651,6 +819,10 @@ def fit_coeffs(flights, arms, volts_map, verbose=False, drag=()):
         if verbose:
             print(f"{axis:7s} R²={rsq:.4f} n={len(y):7d}  " +
                   "  ".join(f"{n}={b:.6g}±{s / abs(b) * 100:.2f}%" for n, b, s in zip(names, beta, se)))
+    if verbose and "latency" in out:
+        lat = out["latency"]
+        print(f"latency: voltage to speed telemetry {lat['voltage_to_telemetry_ms']:.2f} ms "
+              f"(motors {lat['actuator_ms']:.2f} ms, telemetry {lat['telemetry_ms']:.2f} ms)")
     out["pitch"].update(dFront=arms["dFront"], dBack=arms["dBack"])
     out["roll"].update(dLeft=arms["dLeft"], dRight=arms["dRight"])
     out["drag"] = {"axes": list(drag), "lp_hz": DRAG_LP_HZ}
@@ -665,11 +837,12 @@ def stored_arms(coeffs):
 
 
 def evaluate(coeffs, flight, arms, volts_map):
-    """Per-axis R² of `coeffs` on one flight's regression rows."""
+    """Per-axis R² of `coeffs` on one flight's regression rows (the motors' voltages at the fit's delay)."""
     drag = drag_axes(coeffs)
     out = {}
     for axis in AXES:
-        X, y, names, _ = design(flight, axis, arms, volts_map, drag)
+        f = with_voltage_delay(flight, voltage_delay(coeffs)) if axis == "motors" else flight
+        X, y, names, _ = design(f, axis, arms, volts_map, drag)
         out[axis] = float(r2(X, y, np.array([coeffs[axis][n] for n in names])))
     return out
 

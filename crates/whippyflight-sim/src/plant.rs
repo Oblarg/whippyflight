@@ -16,6 +16,8 @@ pub const MOTOR_SPEED_UNIT: &str = "shaft rev/s";
 /// `airframe` block: the Meteor65 Pro (1S) test airframe.
 const DEFAULT_BATTERY_V: Voltage = Voltage::new(4.2);
 const DEFAULT_HOVER_RPS: Rate = Rate::new(450.0);
+/// The most latency a fit may record, per stage.
+const MAX_LATENCY_MS: f64 = 50.0;
 /// Its gyro low-pass stages (type, cutoff), for JSONs without `gyro_lpf`.
 const DEFAULT_GYRO_LPF: [(&str, Freq); 2] = [("PT1", Freq::new(275.0)), ("PT1", Freq::new(550.0))];
 
@@ -67,8 +69,46 @@ pub struct Model {
     /// Stick setpoint tracking index λ at 500 Hz
     /// (`SetpointEstimator::set_lambda`), from `stick_tracking`.
     pub stick_tracking: f32,
+    /// Dead time between a motor command and the motor answering it (the
+    /// ESC), and between the motor's speed and its report (the telemetry),
+    /// from `latency`; 0 without it.
+    pub actuator_delay: Time,
+    pub telemetry_delay: Time,
     /// Where the coefficients came from.
     pub source: String,
+}
+
+/// A fixed delay of whole controller ticks: [`Model::actuator_delay`] on the
+/// motor commands, [`Model::telemetry_delay`] on the speed reports.
+pub struct DelayLine<T: Copy> {
+    queue: std::collections::VecDeque<T>,
+    ticks: usize,
+}
+
+impl<T: Copy> DelayLine<T> {
+    /// `delay` at ticks of `dt`, rounded; the first value pushed fills it.
+    pub fn new(delay: Time, dt: Time) -> Self {
+        let ticks = Self::ticks(delay, dt);
+        Self { queue: std::collections::VecDeque::with_capacity(ticks + 1), ticks }
+    }
+
+    /// The delay a line of `delay` at ticks of `dt` holds: whole ticks.
+    pub fn flown(delay: Time, dt: Time) -> Time {
+        Self::ticks(delay, dt) as f64 * dt
+    }
+
+    fn ticks(delay: Time, dt: Time) -> usize {
+        f64::from(delay / dt).round().max(0.0) as usize
+    }
+
+    /// Push this tick's value; returns the one from `delay` ago.
+    pub fn push(&mut self, x: T) -> T {
+        if self.queue.is_empty() {
+            self.queue.extend(core::iter::repeat_n(x, self.ticks));
+        }
+        self.queue.push_back(x);
+        self.queue.pop_front().unwrap()
+    }
 }
 
 /// The motor layout of a `frame` block.
@@ -148,6 +188,13 @@ impl Model {
                 .collect::<Result<_, String>>()?,
             None => DEFAULT_GYRO_LPF.iter().map(|&(k, f)| (k.to_string(), f)).collect(),
         };
+        let latency = |key: &str| -> Result<Time, String> {
+            match c["latency"][key].as_f64() {
+                None => Ok(Time::new(0.0)),
+                Some(ms) if ms.is_finite() && (0.0..=MAX_LATENCY_MS).contains(&ms) => Ok(Time::new(ms * 1e-3)),
+                Some(ms) => Err(format!("{source}: latency.{key} {ms} ms")),
+            }
+        };
         Ok(Model {
             yaw_rate: PerTime::new(get("yaw", "yawRate")?),
             yaw_prop_vel_sq: PerRot::new(get("yaw", "propVelSumSq")?),
@@ -172,6 +219,8 @@ impl Model {
             stick_tracking: c["airframe"]["stick_tracking"]
                 .as_f64()
                 .map_or(DEFAULT_LAMBDA_500HZ, |l| l as f32),
+            actuator_delay: latency("actuator_ms")?,
+            telemetry_delay: latency("telemetry_ms")?,
             source: source.to_string(),
         })
     }

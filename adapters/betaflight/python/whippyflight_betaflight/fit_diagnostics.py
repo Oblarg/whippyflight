@@ -14,6 +14,20 @@ Per axis (yaw, pitch, roll: angular acceleration in rot/s²; motors: volts):
     histogram;
   * a time-series excerpt: the most heavily excited window of the longest
     flight, measured and predicted.
+Per channel (rate axes and motors), the noise split: where the spectrum of
+what the model leaves unexplained over every usable row (not only the excited
+ones), on the shortest finite difference, stops falling (unmodeled dynamics)
+and starts rising (sensor noise, differentiated): its smoothed minimum, Hz.
+The rate axes' residuals are of the motor model's speeds rather than the
+telemetry, so what rises is the gyro's noise and not the motor speeds' (the
+yaw model differentiates them); the motors' is of the telemetry, whose noise
+it measures.  Below the split the residual is the airframe's, above it the
+sensor's; noise extraction and the turbulence band divide there.
+Per rate axis, turbulence: that residual (of the whole plant the sims fly,
+motors and body, driven by the logged voltages) from TURBULENCE_LOW_HZ to the
+axis's split, as the one-pole spectrum with the same power and the same split about
+the band's middle: its RMS (rot/s²) and corner (Hz), as the flick sim's
+turbulence takes them.
 Per flight: kept time, gating, the pooled fit's R² on that flight alone, and
 the motor-pairing check.  `warnings` lists what looks wrong, as stable codes
 with parameters, so a UI can phrase them.
@@ -24,6 +38,8 @@ re-plots a saved fit's diagnostics without refitting (needs matplotlib).
 """
 
 import numpy as np
+from scipy.optimize import brentq
+from scipy.signal import welch
 
 from whippyflight_betaflight import fit_model as fm
 
@@ -39,6 +55,19 @@ MAX_HELDOUT_DROP = 0.1
 MIN_TOTAL_KEPT_S = 30.0
 MAX_REL_SE = 0.05
 
+# Slower than this is a bias over one flick (a 0.3 s hold between its rise and
+# release), the CG offset's and the pilot's to stand for, not turbulence.
+TURBULENCE_LOW_HZ = 2.0
+# The noise split is searched from here up to SPLIT_MAX of the log rate, on
+# third-octave bands smoothed over SPLIT_SMOOTH of them.
+SPLIT_MIN_HZ = 5.0
+SPLIT_MAX = 0.25
+SPLIT_SMOOTH = 3
+# The residual's finite difference: two samples, its sinc null at the log rate.
+SPLIT_WINDOW = 2
+# Welch segments: as long as a run allows up to the longer, none from runs shorter than the shorter.
+SEGMENT_S = (2.0, 4.0)
+
 
 def _rows(flights, axis, arms, volts_map, drag):
     parts = [fm.design(f, axis, arms, volts_map, drag) for f in flights]
@@ -48,6 +77,90 @@ def _rows(flights, axis, arms, volts_map, drag):
 def _sse_sst(y, pred):
     resid = y - pred
     return float(resid @ resid), float((y - y.mean()) @ (y - y.mean())) if len(y) else 0.0
+
+
+def _residual_spectra(flights, axis, coeffs, arms, volts_map, drag):
+    """
+    The model's residual over every usable row on the SPLIT_WINDOW difference,
+    per contiguous run (each motor's apart): [(freqs, sinc-corrected PSD, rows)].
+    """
+    out = []
+    for f in flights:
+        X, y, names, idx = fm.design(f, axis, arms, volts_map, drag, gated=False, window=SPLIT_WINDOW)
+        resid = y - X @ np.array([coeffs[axis][n] for n in names])
+        shortest, longest = (int(s * f.log_hz) for s in SEGMENT_S)
+        for run in np.split(np.arange(len(idx)), np.flatnonzero(np.diff(idx) != 1) + 1):
+            if len(run) < shortest:
+                continue
+            fr, psd = welch(resid[run], fs=f.log_hz, nperseg=min(longest, len(run)))
+            out.append((fr, psd / np.sinc(fr * SPLIT_WINDOW / f.log_hz) ** 2, len(run)))
+    return out
+
+
+def _band_power(spectra, lo, hi):
+    """Mean over rows of the power in [lo, hi)."""
+    rows = sum(n for *_, n in spectra)
+    return sum(psd[(fr >= lo) & (fr < hi)].sum() * (fr[1] - fr[0]) * n for fr, psd, n in spectra) / rows
+
+
+def _split(spectra, log_hz):
+    """The smoothed third-octave minimum of the residual's spectrum, Hz; None without one."""
+    edges = SPLIT_MIN_HZ * 2.0 ** (np.arange(int(3 * np.log2(SPLIT_MAX * log_hz / SPLIT_MIN_HZ)) + 1) / 3)
+    density = np.array([_band_power(spectra, a, b) / (b - a) for a, b in zip(edges, edges[1:])])
+    if len(density) < SPLIT_SMOOTH or not (density > 0).all():
+        return None
+    smooth = np.exp(np.convolve(np.log(density), np.ones(SPLIT_SMOOTH) / SPLIT_SMOOTH, "valid"))
+    k = int(np.argmin(smooth)) + SPLIT_SMOOTH // 2
+    return float(np.sqrt(edges[k] * edges[k + 1]))
+
+
+def modeled(flights, coeffs, volts_map):
+    """`flights` with the motor model's speeds for the telemetry's."""
+    return [fm.with_modeled_speeds(f, coeffs, volts_map) for f in flights]
+
+
+def noise_split(flights, clean, coeffs, arms, volts_map, drag):
+    """Per channel, the noise split (Hz), or None; `clean` is `modeled(flights, …)`."""
+    log_hz = min(f.log_hz for f in flights)
+    out = {}
+    for axis in fm.AXES:
+        spectra = _residual_spectra(flights if axis == "motors" else clean, axis, coeffs, arms, volts_map, drag)
+        hz = _split(spectra, log_hz) if spectra else None
+        out[axis] = round(hz, 1) if hz else None
+    return out
+
+
+def _one_pole_power(lo, hi, hz):
+    """∫ 1/(1 + (f/hz)²) df over [lo, hi]."""
+    return hz * (np.arctan(hi / hz) - np.arctan(lo / hz))
+
+
+def turbulence(clean, coeffs, arms, volts_map, drag, split):
+    """
+    Per rate axis, {rms, hz} of the one-pole spectrum with the residual's power
+    from TURBULENCE_LOW_HZ to the axis's `split` and its division about the
+    band's geometric middle; None if too little data, no split, or a spectrum
+    no one-pole has.
+    """
+    out = {}
+    for axis in ("yaw", "pitch", "roll"):
+        lo, hi = TURBULENCE_LOW_HZ, split.get(axis)
+        spectra = _residual_spectra(clean, axis, coeffs, arms, volts_map, drag)
+        if not spectra or not hi or hi <= 2 * lo:
+            out[axis] = None
+            continue
+        mid = np.sqrt(lo * hi)
+        low, high = _band_power(spectra, lo, mid), _band_power(spectra, mid, hi)
+        # A one-pole spectrum's division runs from the flat (mid − lo)/(hi − mid) at
+        # a high corner to the f⁻² (1/lo − 1/mid)/(1/mid − 1/hi) at a low one.
+        division = lambda hz: _one_pole_power(lo, mid, hz) / _one_pole_power(mid, hi, hz) - low / high
+        if not (low > 0 and high > 0) or division(1e-3) * division(1e4) >= 0:
+            out[axis] = None
+            continue
+        hz = brentq(division, 1e-3, 1e4)
+        s0 = (low + high) / _one_pole_power(lo, hi, hz)
+        out[axis] = {"rms": round(float(np.sqrt(s0 * hz * np.pi / 2)), 5), "hz": round(float(hz), 3)}
+    return out
 
 
 def heldout_r2(flights, arms, volts_map, drag):
@@ -112,15 +225,19 @@ def _excerpt(flight, axis, beta, arms, volts_map, drag):
 def diagnostics(flights, coeffs, volts_map):
     arms = fm.stored_arms(coeffs)
     drag = fm.drag_axes(coeffs)
-    heldout, method = heldout_r2(flights, arms, volts_map, drag)
+    clean = modeled(flights, coeffs, volts_map)
+    # The motor rows' voltages at the fit's delay (only the motor rows read them).
+    lagged = [fm.with_voltage_delay(f, fm.voltage_delay(coeffs)) for f in flights]
+    heldout, method = heldout_r2(lagged, arms, volts_map, drag)
     rng = np.random.default_rng(0)
-    longest = max(flights, key=lambda f: f.kept_s())
+    longest = max(lagged, key=lambda f: f.kept_s())
     axes = {}
     warnings = []
+    split = noise_split(lagged, clean, coeffs, arms, volts_map, drag)
     for axis in fm.AXES:
         names = fm.design(flights[0], axis, arms, volts_map, drag)[2]
         beta = np.array([coeffs[axis][n] for n in names])
-        X, y = _rows(flights, axis, arms, volts_map, drag)
+        X, y = _rows(lagged, axis, arms, volts_map, drag)
         pred = X @ beta
         resid = y - pred
         sse, sst = _sse_sst(y, pred)
@@ -176,6 +293,8 @@ def diagnostics(flights, coeffs, volts_map):
             "kept_s": round(kept, 1),
             "drag_axes": list(drag),
             "axes": axes,
+            "noise_split_hz": split,
+            "turbulence": turbulence(clean, coeffs, arms, volts_map, drag, split),
             "flights": per_flight,
             "warnings": warnings}
 

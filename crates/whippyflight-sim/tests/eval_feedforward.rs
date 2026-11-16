@@ -6,7 +6,8 @@
 //!
 //! Flies test_gains.wfg, or the blob at $WFG_PATH (zero its feedback gains
 //! to see the feedforward + affine linearizer alone), through roll and pitch
-//! flicks of 0.05–4 rot/s rising over 30 ms and 10 ms.  Each flick is flown
+//! flicks of 0.05–4 rot/s rising over 30 ms and 10 ms, the gyro through the
+//! airframe's gyro filters.  Each flick is flown
 //! twice — with and without the stick — and the metrics are taken on the
 //! difference.  `flick_summary` prints one SUMMARY line for
 //! tools/sweep_qr.py.
@@ -17,7 +18,8 @@ mod common;
 
 use common::units::{Rate, Time};
 use whippyflight_control::gains::{load_gains, GainStorage};
-use whippyflight_sim::flick::{self, Limits, Metrics};
+use whippyflight_sim::flick::{self, Conditions, Limits, Metrics};
+use whippyflight_sim::margin::pt1_cutoffs;
 use whippyflight_control::types::*;
 use whippyunits::value;
 
@@ -43,7 +45,9 @@ fn load() -> GainStorage {
 
 fn all_flicks(gains: &GainStorage) -> Vec<(usize, Time, Rate, Metrics)> {
     let limits = Limits { slew: env_f32("FF_SLEW"), jerk: env_f32("FF_JERK") };
-    flick::all_flicks(gains, common::plant::model(), limits)
+    let model = common::plant::model();
+    let filter = pt1_cutoffs(model).unwrap();
+    flick::all_flicks(gains, model, limits, &Conditions::of(&filter))
         .into_iter()
         .map(|(axis, rise, amp, f)| (axis, rise, amp, f.metrics))
         .collect()

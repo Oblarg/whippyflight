@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "whippyflight-betaflight"
 version = "0.1.0"
 description = "Betaflight tools for whippyflight: blackbox decoding, the plant fit, and sensor noise extraction"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
 authors = [{ name = "Oblarg" }]
 requires-python = ">=3.11"

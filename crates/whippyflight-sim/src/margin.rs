@@ -10,7 +10,7 @@ use whippyunits::api::rescale;
 
 use crate::flick::roughness;
 use crate::noise::Noise;
-use crate::plant::{Model, Plant};
+use crate::plant::{DelayLine, Model, Plant};
 use crate::units::*;
 use whippyflight_control::controller::ControllerState;
 use whippyflight_control::gains::GainStorage;
@@ -182,6 +182,7 @@ fn flight(
     sp.configure_for(gains);
     model.configure(&mut ctrl, &mut sp);
     let mut plant = Plant::hovering(model, HOVER_SCALE);
+    let (mut actuator, mut telemetry) = (DelayLine::new(model.actuator_delay, dt), DelayLine::new(model.telemetry_delay, dt));
     let throttle = model.throttle_at(1.0);
     let t_end = SETTLE + after;
     let mut next_pkt = Time::new(0.0);
@@ -205,9 +206,9 @@ fn flight(
         }
         let (rate, target) = sp.tick(now_us, dt.lossy_into());
         let mut gyro_rps = path.filter(plant.gyro());
-        let mut motor_rps = plant.motor_rps();
+        let mut motor_rps = telemetry.push(plant.motor_rps());
         if let Some(noise) = noise {
-            let s = noise.at(t);
+            let s = noise.at(t, plant.motor_rps());
             (0..3).for_each(|a| gyro_rps[a] += s.gyro[a]);
             (0..4).for_each(|m| motor_rps[m] += s.motor[m]);
         }
@@ -226,6 +227,7 @@ fn flight(
             target,
             gains,
         );
+        sp.condition(ctrl.reachable_target());
         let volts = model.duty_volts(out.motor_duty);
         let no_torque = AngAccel::new(0.0);
         let torque = [
@@ -233,8 +235,9 @@ fn flight(
             if t >= SETTLE { torque_pitch } else { no_torque },
             no_torque,
         ];
+        let applied = actuator.push(volts);
         for _ in 0..4 {
-            plant.rk4_with_torque(&volts, dt / 4.0, torque);
+            plant.rk4_with_torque(&applied, dt / 4.0, torque);
         }
         if t >= SETTLE {
             n += 1;

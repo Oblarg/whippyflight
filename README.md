@@ -46,7 +46,7 @@ The Betaflight adapter (`src/main/flight/whippyflight` in the Betaflight tree) i
 
 ## Python
 
-Python 3.11+:
+Python 3.11+, from the repo root:
 
 ```sh
 python3 -m venv tools/.venv

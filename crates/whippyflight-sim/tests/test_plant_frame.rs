@@ -37,6 +37,28 @@ fn legacy_arms_swap_into_the_physical_frame() {
 }
 
 #[test]
+fn latency_loads_and_delays_whole_ticks() {
+    use whippyflight_sim::plant::DelayLine;
+    use whippyflight_sim::units::Time;
+    assert_eq!(model(CANONICAL).actuator_delay, Time::new(0.0), "none recorded");
+    let mut c: serde_json::Value = serde_json::from_str(CANONICAL).unwrap();
+    c["latency"] = serde_json::json!({"actuator_ms": 0.31, "telemetry_ms": 3.23});
+    let m = model(&c.to_string());
+    assert!((m.actuator_delay - Time::new(0.31e-3)).abs() < Time::new(1e-12));
+    assert!((m.telemetry_delay - Time::new(3.23e-3)).abs() < Time::new(1e-12));
+    c["latency"]["actuator_ms"] = (-1.0).into();
+    assert!(Model::from_json(&c.to_string(), "test").is_err());
+
+    let mut line = DelayLine::new(Time::new(1e-3), Time::new(0.3e-3));
+    let out: Vec<i32> = (1..=6).map(|x| line.push(x)).collect();
+    assert_eq!(out, [1, 1, 1, 1, 2, 3], "3 ticks, filled with the first value");
+    let mut none = DelayLine::new(Time::new(0.0), Time::new(0.3e-3));
+    assert_eq!(none.push(7), 7);
+    let flown = DelayLine::<i32>::flown(Time::new(1e-3), Time::new(0.3e-3));
+    assert!((flown - Time::new(0.9e-3)).abs() < Time::new(1e-12));
+}
+
+#[test]
 fn bad_frames_are_rejected() {
     let mut c: serde_json::Value = serde_json::from_str(CANONICAL).unwrap();
     c["frame"]["motors"][0]["position"] = "front_left".into();

@@ -14,6 +14,7 @@ mod common;
 
 use common::units::{Rate, Time};
 use whippyflight_control::controller::ControllerState;
+use whippyflight_control::interpolation::interpolate_gains;
 use whippyflight_control::gains::{load_gains, GainStorage, MotorPosition, Spin, GAIN_VERSION, REF_MOTOR_SLOTS};
 use whippyflight_control::types::*;
 use whippyunits::value;
@@ -126,12 +127,13 @@ fn real_gains_are_nonzero() {
     let ki_nz = (0..table_len).filter(|&i| gains.ki.get(i).abs() > VoltPerRot::new(1e-8)).count();
     let kd_nz = (0..table_len).filter(|&i| gains.kd.get(i).abs() > VoltPerRpsPerSec::new(1e-8)).count();
     let kp_nz = (0..table_len).filter(|&i| gains.kp.get(i).abs() > VoltPerRps::new(1e-8)).count();
-    let binv_nz = (0..table_len).filter(|&i| gains.binv.get(i).abs() > VoltPerRps::new(1e-8)).count();
 
     assert!(ki_nz > table_len / 2, "Ki mostly zero: {ki_nz}/{table_len}");
     assert!(kd_nz > table_len / 2, "Kd mostly zero: {kd_nz}/{table_len}");
     assert!(kp_nz > table_len / 2, "Kp mostly zero: {kp_nz}/{table_len}");
-    assert!(binv_nz > 0, "B⁻¹ entirely zero");
+    let mid = (gains.header.min_rps + gains.header.max_rps) * 0.5;
+    let binv = interpolate_gains(&[mid; 4], &gains).binv;
+    assert!(binv.as_uniform().amax() > VoltPerRps::new(1e-8), "G_h⁺ entirely zero");
 }
 
 // ── Hover equilibrium ───────────────────────────────────────────────────
@@ -818,8 +820,7 @@ fn quantized_tables_are_views_into_blob() {
     let mut gains = GainStorage::new();
     assert_eq!(load_gains(blob, &mut gains), GainLoadResult::Ok);
     let range = blob.as_ptr_range();
-    let tables = [gains.ki.data_ptr(), gains.kd.data_ptr(), gains.kp.data_ptr(), gains.binv.data_ptr(),
-                  gains.ref_model.data_ptr()];
+    let tables = [gains.ki.data_ptr(), gains.kd.data_ptr(), gains.kp.data_ptr(), gains.ref_model.data_ptr()];
     for ptr in tables {
         assert!(range.contains(&ptr), "table was copied");
     }

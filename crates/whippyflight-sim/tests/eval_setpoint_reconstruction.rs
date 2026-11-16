@@ -185,7 +185,9 @@ fn fly(gains: &GainStorage, axis: usize, stick: &dyn Fn(Time) -> Rate, dur: Time
             Some(tg) => {
                 let mut tgt = [RotPerSec::new(0.0); 3];
                 tgt[axis] = tg.lossy_into();
-                ctrl.update_with_target(&sensors, &sp, tgt, gains)
+                let out = ctrl.update_with_target(&sensors, &sp, tgt, gains);
+                recon.estimator.condition(ctrl.reachable_target());
+                out
             }
             None => ctrl.update(&sensors, &sp, gains),
         };

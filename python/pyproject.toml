@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "whippyflight"
 version = "0.1.0"
 description = "Gain generation for whippyflight-control: DARE over a motor-speed grid, packed into .wfg blobs"
-readme = "../README.md"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
 authors = [{ name = "Oblarg" }]
 requires-python = ">=3.11"

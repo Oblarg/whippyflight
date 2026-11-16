@@ -28,7 +28,9 @@
 //! ū_ff is the part of u_ff the allocator actually delivered, so under
 //! saturation the model follows what the motors flew rather than what was
 //! asked.  The feedback regulates the measured rate onto r_ref, the model's
-//! own rate, not onto the setpoint.
+//! own rate, not onto the setpoint.  What ū_ff reaches over the horizon is
+//! reported back ([`ControllerState::reachable_target`]) so the setpoint
+//! estimator can hold its target there instead of running ahead.
 //!
 //! The reference model sees no measurements, so gyro/eRPM noise never
 //! passes through G_h⁺; measured errors are left to the LQR feedback.
@@ -50,9 +52,29 @@
 //! ```
 //!
 //! so the feedforward cancels the torque and r_ref stays on the setpoint.
+//!
+//! # Thrust curvature
+//!
+//! Thrust goes as ω|ω|, but the reference model is linear in δω_ref,
+//! relinearized at the measured speed ω̂: it credits motor m with
+//! k_m·2ω̂·δω where its torque changed by k_m·(ω̂² − (ω̂ − δω)²), short by
+//! k_m·δω².  Those terms cancel across a symmetric command, but not when
+//! the motors start at different speeds (a CG offset) or move unequally: a
+//! hard yaw then tilts the airframe about a diagonal the model never sees.
+//! With the blob's thrust torque k_m (see [`crate::gains::ThrustTorque`]),
+//! the shortfall is a known disturbance, held over the horizon and
+//! propagated like the drag:
+//!
+//! ```text
+//!   α_c = −Σ_m k_m·δω_m²          (roll, pitch)
+//! ```
+//!
+//! It reads only δω_ref, which sees no measurements, so it adds no noise
+//! path of its own.  Yaw needs none: its curvature is in range of the
+//! affine linearizer.
 
 use crate::allocation::{allocate, balanced_direction};
-use crate::gains::{GainStorage, ReferenceModel};
+use crate::gains::{GainStorage, ReferenceModel, ThrustTorque};
 use crate::interpolation::interpolate_gains;
 use crate::types::*;
 
@@ -94,6 +116,8 @@ pub struct ControllerState {
     accel_lp: Option<[MetersPerSecSq; 2]>,
     /// Latest telemetry.
     telemetry: LqrTelemetry,
+    /// See [`Self::reachable_target`].
+    reachable: Option<[RotPerSec; 3]>,
 }
 
 impl ControllerState {
@@ -129,6 +153,7 @@ impl ControllerState {
                 ff_target_rps: Default::default(),
                 status: 0,
             },
+            reachable: None,
         }
     }
 
@@ -144,6 +169,7 @@ impl ControllerState {
         self.airborne = false;
         self.landing_s = Seconds::new(0.0);
         self.motor_rps_lp = None;
+        self.reachable = None;
         #[cfg(feature = "airframe-drag")]
         {
             self.accel_lp = None;
@@ -189,6 +215,14 @@ impl ControllerState {
 
     pub fn telemetry(&self) -> &LqrTelemetry {
         &self.telemetry
+    }
+
+    /// When the last command saturated, the feedforward target
+    /// [roll, pitch, yaw] the voltage the motors got reaches over the
+    /// horizon; `None` otherwise.  Feed it to
+    /// [`crate::setpoint::SetpointEstimator::condition`].
+    pub fn reachable_target(&self) -> Option<[RotPerSec; 3]> {
+        self.reachable
     }
 
     /// Run one control iteration.
@@ -324,7 +358,10 @@ impl ControllerState {
             Some(t) => from_array(t),
             None => setpoint_vec + setpoint_diff.scale(gains.header.ff_horizon as f32),
         };
-        let drag = self.airframe_drag(sensors, gains, dt);
+        let disturbance = match (self.airframe_drag(sensors, gains, dt), self.thrust_curvature(gains, dt)) {
+            (Some(drag), Some(curvature)) => Some(drag + curvature),
+            (drag, curvature) => drag.or(curvature),
+        };
         // None on the ground: the speeds there are idle, far below hover,
         // where thrust per volt is small and G_h⁺ large, so a gentle stick
         // ramp asks for ±Vbat, and the airframe resting on the ground can't
@@ -332,7 +369,7 @@ impl ControllerState {
         let feedforward: MotorVoltageVec = if !self.airborne {
             zeros![MotorAxes, Scalar as f32]
         } else {
-            self.reference_feedforward(&interp.ref_model, &interp.binv, target, drag,
+            self.reference_feedforward(&interp.ref_model, &interp.binv, target, disturbance,
                                        gains.header.ff_horizon, battery_v)
         };
 
@@ -360,6 +397,7 @@ impl ControllerState {
         };
 
         self.saturated = alloc.saturated;
+        self.reachable = None;
 
         // Propagate the reference model with the feedforward the motors
         // actually got: each motor's share of its command that survived
@@ -380,7 +418,11 @@ impl ControllerState {
             } else {
                 feedforward
             };
-            self.propagate_reference(&interp.ref_model, realized, drag);
+            if alloc.saturated {
+                self.reachable = Some(to_array(&self.horizon_rate(
+                    &interp.ref_model, realized, disturbance, gains.header.ff_horizon)));
+            }
+            self.propagate_reference(&interp.ref_model, realized, disturbance);
         }
 
         // --- Populate telemetry ---
@@ -479,6 +521,21 @@ impl ControllerState {
         None
     }
 
+    /// This tick's thrust-curvature correction to the reference model,
+    /// −Σ_m k_m·δω_m²·dt on roll and pitch (see module docs), or `None` when
+    /// the blob has no thrust torque.
+    fn thrust_curvature(&self, gains: &GainStorage, dt: Seconds) -> Option<PropErrorVec> {
+        let torque = gains.thrust_torque;
+        if torque == ThrustTorque::ZERO {
+            return None;
+        }
+        let speed = to_array(&self.ref_speed);
+        let lost = |k: &[PerRot; 4]| {
+            (0..4).fold(RotPerSecSq::new(0.0), |acc, m| acc - k[m] * speed[m] * speed[m]) * dt
+        };
+        Some(from_array([lost(&torque.roll), lost(&torque.pitch), RotPerSec::new(0.0)]))
+    }
+
     /// The reference-model feedforward command for this tick (see module docs).
     ///
     /// `ref_model` is the interpolated reference model at the current
@@ -488,7 +545,7 @@ impl ControllerState {
         ref_model: &ReferenceModel,
         binv: &BInvMatrix,
         target: PropErrorVec,
-        drag: Option<PropErrorVec>,
+        disturbance: Option<PropErrorVec>,
         horizon: u8,
         battery_v: Volt,
     ) -> MotorVoltageVec {
@@ -501,7 +558,7 @@ impl ControllerState {
         }));
 
         let mut request: SetpointDiffVec = target - free;
-        if let Some(d) = drag {
+        if let Some(d) = disturbance {
             // Horizon response to the disturbance held constant: Σ_{j<h} ad_rr^j ⊙ d.
             let mut decay = [1.0f32; 3];
             let mut sum = [0.0f32; 3];
@@ -518,21 +575,39 @@ impl ControllerState {
         from_array(to_array(&u_ff).map(|v| v.clamp(-battery_v, battery_v)))
     }
 
+    /// The reference model's rate after `horizon` ticks of `u` and the
+    /// disturbance held: what that feedforward reaches.
+    fn horizon_rate(&self, m: &ReferenceModel, u: MotorVoltageVec, disturbance: Option<PropErrorVec>,
+                    horizon: u8) -> PropErrorVec {
+        let mut rate = self.ref_rate;
+        let mut speed = self.ref_speed;
+        let uu = to_array(&u);
+        let from_volt = to_array(&(m.bd_r * u));
+        let d = disturbance.map_or([RotPerSec::new(0.0); 3], |d| to_array(&d));
+        for _ in 0..horizon {
+            let (r, s) = (to_array(&rate), to_array(&speed));
+            let fs = to_array(&(m.ad_rw * speed));
+            rate = from_array(core::array::from_fn(|i| m.ad_rr[i] * r[i] + fs[i] + from_volt[i] + d[i]));
+            speed = from_array(core::array::from_fn(|k| m.ad_ww[k] * s[k] + m.bd_w[k] * uu[k]));
+        }
+        rate
+    }
+
     /// One-tick ZOH propagation of the reference model with the voltage
-    /// it actually got, plus the airframe drag disturbance:
-    /// δx ← Ad·δx + Bd·u + [d; 0].
+    /// it actually got, plus the disturbance (airframe drag, thrust
+    /// curvature): δx ← Ad·δx + Bd·u + [d; 0].
     fn propagate_reference(
         &mut self,
         ref_model: &ReferenceModel,
         u_ff: MotorVoltageVec,
-        drag: Option<PropErrorVec>,
+        disturbance: Option<PropErrorVec>,
     ) {
         let rate = to_array(&self.ref_rate);
         let speed = to_array(&self.ref_speed);
         let u = to_array(&u_ff);
         let from_speed = to_array(&(ref_model.ad_rw * self.ref_speed));
         let from_volt = to_array(&(ref_model.bd_r * u_ff));
-        let disturbance = drag.map_or([RotPerSec::new(0.0); 3], |d| to_array(&d));
+        let disturbance = disturbance.map_or([RotPerSec::new(0.0); 3], |d| to_array(&d));
         self.ref_rate = from_array(core::array::from_fn(|i| {
             ref_model.ad_rr[i] * rate[i] + from_speed[i] + from_volt[i] + disturbance[i]
         }));
@@ -557,7 +632,6 @@ const MIN_BATTERY_V: Volt = Volt::new(1.0);
 /// Commands smaller than this count as fully delivered when sharing out a
 /// saturated command, so the ratio stays finite.
 const KEPT_MIN_COMMAND: Volt = Volt::new(1e-6);
-
 /// Largest integral voltage on any motor, as a fraction of battery voltage.
 const INTEGRAL_VOLTAGE_FRACTION: f32 = 0.2;
 

@@ -4,7 +4,7 @@ mod common;
 
 use whippyflight_control::controller::ControllerState;
 use whippyflight_control::gains::spec::BlobSpec;
-use whippyflight_control::gains::{GainStorage, load_gains};
+use whippyflight_control::gains::{GainStorage, REF_MOTOR_SLOTS, REF_MOTOR_WIDTH, load_gains};
 use whippyflight_control::types::*;
 
 const DT: Seconds = Seconds::new(0.000125);
@@ -16,7 +16,7 @@ struct Diag {
     kp: VoltPerRps,
     ki: VoltPerRot,
     kd: VoltPerRpsPerSec,
-    binv: VoltPerRps,
+    gh: RpsPerVolt,
 }
 
 impl Diag {
@@ -24,13 +24,13 @@ impl Diag {
         kp: VoltPerRps::new(0.0),
         ki: VoltPerRot::new(0.0),
         kd: VoltPerRpsPerSec::new(0.0),
-        binv: VoltPerRps::new(0.0),
+        gh: RpsPerVolt::new(0.0),
     };
 }
 
 /// Build a gain blob with identity-like gains for testing.
-/// Kp = diag(kp), Ki = diag(ki), Kd = diag(kd), Binv = diag(binv)
-/// (extended to 4×3: motor i maps to axis i for i < 3, motor 3 = zeros).
+/// Kp = diag(kp), Ki = diag(ki), Kd = diag(kd), G_h = diag(gh)
+/// (motor i maps to axis i for i < 3, motor 3 = zeros), so G_h⁺ = diag(1/gh).
 /// The reference model holds its rate and nothing drives it, so it stays
 /// where it was seeded: the first tick's setpoint.
 fn make_identity_gains(resolution: u8, gains: &Diag, dt: Seconds) -> Vec<u8> {
@@ -43,7 +43,12 @@ fn make_identity_gains(resolution: u8, gains: &Diag, dt: Seconds) -> Vec<u8> {
     diag(&mut spec.ki, gains.ki);
     diag(&mut spec.kd, gains.kd);
     diag(&mut spec.kp, gains.kp);
-    diag(&mut spec.binv, gains.binv);
+    let gh: f32 = bytemuck::cast(gains.gh);
+    for g in 0..resolution as usize {
+        for m in 0..3 {
+            spec.ref_motor[g * REF_MOTOR_WIDTH + m * REF_MOTOR_SLOTS + 11 + m] = gh;
+        }
+    }
     spec.encode()
 }
 
@@ -248,7 +253,7 @@ fn derivative_responds_to_error_change() {
 
 #[test]
 fn feedforward_responds_to_setpoint_change() {
-    let gains = load_identity_gains(Diag { binv: VoltPerRps::new(1.0), ..Diag::ZERO });
+    let gains = load_identity_gains(Diag { gh: RpsPerVolt::new(1.0), ..Diag::ZERO });
     let mut ctrl = ControllerState::new();
 
     // First iteration: setpoint=[0,0,0]
@@ -274,7 +279,7 @@ fn reset_clears_state() {
         kp: VoltPerRps::new(1.0),
         ki: VoltPerRot::new(1.0),
         kd: VoltPerRpsPerSec::new(1.0),
-        binv: VoltPerRps::new(1.0),
+        gh: RpsPerVolt::new(1.0),
     });
     let mut ctrl = ControllerState::new();
 

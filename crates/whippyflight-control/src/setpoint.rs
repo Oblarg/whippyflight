@@ -31,6 +31,14 @@
 //! the feedforward only inverts the next h ticks, so a target that needs
 //! more acceleration — or a faster stop — than the motors have saturates
 //! them, and the motors' spin-down lag then carries the airframe past it.
+//!
+//! The bounds are fixed, though, and what the motors can do isn't (battery
+//! sag, throttle, a heavier airframe).  So whenever allocation saturates,
+//! the target is conditioned: pulled back to what the delivered voltage
+//! reaches over the horizon ([`SetpointEstimator::condition`]).  Otherwise
+//! it runs ahead, the feedforward spends the motors' authority catching up
+//! with it, and the motor-speed difference built doing so carries the
+//! airframe past the stop.  Unsaturated, conditioning does nothing.
 
 use crate::gains::GainStorage;
 use crate::types::*;
@@ -199,6 +207,28 @@ impl SetpointEstimator {
         self.target = target;
         self.target_valid = true;
         (rate, target)
+    }
+
+    /// Pull the target back to what the motors can reach
+    /// ([`ControllerState::reachable_target`]), on each axis where it has
+    /// run ahead of it in its direction of travel.  Call after every
+    /// controller update; `None` (not saturated) leaves the target alone.
+    ///
+    /// [`ControllerState::reachable_target`]: crate::controller::ControllerState::reachable_target
+    pub fn condition(&mut self, reachable: Option<[RotPerSec; 3]>) {
+        let Some(reachable) = reachable else { return };
+        if !self.target_valid {
+            return;
+        }
+        let zero = RotPerSecSq::new(0.0);
+        for i in 0..3 {
+            let ahead = self.target[i] - reachable[i];
+            if (self.target_v[i] > zero && ahead > RotPerSec::new(0.0))
+                || (self.target_v[i] < zero && ahead < RotPerSec::new(0.0))
+            {
+                self.target[i] = reachable[i];
+            }
+        }
     }
 
     fn set_period(&mut self, period: Seconds) {

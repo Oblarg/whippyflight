@@ -10,7 +10,7 @@ use whippyflight_control::types::*;
 /// `fill_value` (in its own unit).
 fn make_gain_blob(resolution: u8, fill_value: f32) -> Vec<u8> {
     let mut spec = BlobSpec::new(resolution);
-    for table in [&mut spec.ki, &mut spec.kd, &mut spec.kp, &mut spec.binv] {
+    for table in [&mut spec.ki, &mut spec.kd, &mut spec.kp] {
         table.fill(fill_value);
     }
     spec.encode()
@@ -61,7 +61,6 @@ fn load_valid_gains_resolution_2() {
         assert_eq!(storage.ki.get(i), VoltPerRot::new(1.0), "ki[{i}]");
         assert_eq!(storage.kd.get(i), VoltPerRpsPerSec::new(1.0), "kd[{i}]");
         assert_eq!(storage.kp.get(i), VoltPerRps::new(1.0), "kp[{i}]");
-        assert_eq!(storage.binv.get(i), VoltPerRps::new(1.0), "binv[{i}]");
     }
 }
 
@@ -84,6 +83,7 @@ fn blocks_round_trip() {
     spec.airframe_drag = [5.0, 0.1, -0.2, 0.3, -0.4];
     spec.target_limits = [30.0, 900.0];
     spec.hover = [220.0, 0.6];
+    spec.thrust_torque = [-1.3e-4, -1.3e-4, 1.2e-4, 1.2e-4, -1.0e-4, 1.1e-4, -1.0e-4, 1.1e-4];
     spec.layout = MotorLayout {
         position: [
             MotorPosition::RearRight,
@@ -107,6 +107,8 @@ fn blocks_round_trip() {
     );
     assert_eq!([raw(s.target_limits.slew), raw(s.target_limits.jerk)], spec.target_limits);
     assert_eq!([raw(s.hover_rps), raw(s.integral_limit_v)], spec.hover);
+    let t = s.thrust_torque;
+    assert_eq!([t.roll.map(raw), t.pitch.map(raw)].concat(), spec.thrust_torque);
     assert_eq!(s.layout, spec.layout);
 }
 
@@ -156,7 +158,7 @@ fn reject_bad_magic() {
 
 #[test]
 fn reject_other_versions() {
-    for version in [1u16, 7, 8, 10, 99] {
+    for version in [1u16, 8, 9, 11, 99] {
         let mut blob = make_gain_blob(2, 1.0);
         blob[4..6].copy_from_slice(&version.to_le_bytes());
         refresh_crc(&mut blob);
@@ -290,10 +292,35 @@ fn tables_are_views_into_blob() {
         storage.ki.data_ptr(),
         storage.kd.data_ptr(),
         storage.kp.data_ptr(),
-        storage.binv.data_ptr(),
         storage.ref_model.data_ptr(),
     ];
     for ptr in tables {
         assert!(range.contains(&ptr), "table was copied");
+    }
+}
+
+#[test]
+fn with_feedback_zeroes_only_the_terms_left_out() {
+    let mut spec = BlobSpec::new(2);
+    for table in [&mut spec.ki, &mut spec.kd, &mut spec.kp] {
+        table.fill(1.0);
+    }
+    spec.ref_motor.fill(0.5);
+    let blob = spec.encode();
+    let p_only = FeedbackTerms { p: true, i: false, d: false };
+    let id = FeedbackTerms { p: false, i: true, d: true };
+    for keep in [FeedbackTerms::NONE, FeedbackTerms::ALL, p_only, id] {
+        let (result, storage) = load(&with_feedback(&blob, keep));
+        assert_eq!(result, GainLoadResult::Ok, "{keep:?}");
+        for i in 0..storage.kp.len() {
+            let kept = |on: bool| if on { 1.0 } else { 0.0 };
+            assert!((storage.ki.get(i) - VoltPerRot::new(kept(keep.i))).abs() < VoltPerRot::new(1e-3), "{keep:?} ki[{i}]");
+            assert!(
+                (storage.kd.get(i) - VoltPerRpsPerSec::new(kept(keep.d))).abs() < VoltPerRpsPerSec::new(1e-3),
+                "{keep:?} kd[{i}]"
+            );
+            assert!((storage.kp.get(i) - VoltPerRps::new(kept(keep.p))).abs() < VoltPerRps::new(1e-3), "{keep:?} kp[{i}]");
+        }
+        assert!((storage.ref_model.get(0) - 0.5).abs() < 1e-6);
     }
 }

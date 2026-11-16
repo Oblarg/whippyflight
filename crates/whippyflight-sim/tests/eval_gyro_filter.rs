@@ -196,13 +196,14 @@ fn fly_inner_with(gains: &GainStorage, amp: Rate, kick: Rate, settle: Time, mut 
         let mut gyro = path.filter(plant.gyro());
         let mut motor_rps = plant.motor_rps();
         if let Some(noise) = noise {
-            let s = noise.at(t);
+            let s = noise.at(t, plant.motor_rps());
             (0..3).for_each(|a| gyro[a] = gyro[a] + s.gyro[a]);
             (0..4).for_each(|m| motor_rps[m] = motor_rps[m] + s.motor[m]);
         }
         let sensors = SensorData { gyro_rps: gyro, motor_rps, battery_voltage: battery_v(), accel: [MetersPerSecSq::new(0.0); 3] };
         let out = ctrl.update_with_target(&sensors, &SetpointData { rate_rps: rate, throttle: throttle() },
                                           target, gains);
+        sp.condition(ctrl.reachable_target());
         volts = duty_volts(out.motor_duty);
         for m in 0..4 {
             volts_lp[m] = volts_lp[m] + hp_k * (volts[m] - volts_lp[m]);

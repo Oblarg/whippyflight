@@ -22,6 +22,7 @@ pub struct InterpolatedGains {
     pub ki: KiMatrix,
     pub kd: KdMatrix,
     pub kp: KpMatrix,
+    /// Horizon inverse G_h⁺, computed from the interpolated G_h.
     pub binv: BInvMatrix,
     /// Reference-model terms.
     pub ref_model: ReferenceModel,
@@ -105,12 +106,13 @@ pub fn interpolate_gains(
 
     let vertices = Vertices::new(n, &lower, &frac);
 
+    let ref_model = ReferenceModel::from_slots(&reference_model(storage, &lower, &frac));
     InterpolatedGains {
         ki: interpolate_4x3!(vertices, storage.ki),
         kd: interpolate_4x3!(vertices, storage.kd),
         kp: interpolate_4x3!(vertices, storage.kp),
-        binv: interpolate_4x3!(vertices, storage.binv),
-        ref_model: ReferenceModel::from_slots(&reference_model(storage, &lower, &frac)),
+        binv: ref_model.horizon_inverse(),
+        ref_model,
     }
 }
 

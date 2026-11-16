@@ -241,6 +241,35 @@ fn set_lambda_retunes_a_running_estimator() {
     assert!(retuned > kept, "retuned={retuned:?} kept={kept:?}");
 }
 
+/// Conditioning pulls a rising target back to a reachable value below it,
+/// but not up to one above it; `None` changes nothing.
+#[test]
+fn condition_holds_the_target_at_the_reachable() {
+    let rising = || {
+        let mut est = SetpointEstimator::new();
+        est.configure(8.0, RotPerSecSq::new(100.0), RotPerSecCu::new(2000.0));
+        let step = |t: Seconds| if t >= PERIOD { RotPerSec::new(1.0) } else { ZERO };
+        let (_, target, _) = run(&mut est, step, 10);
+        (est, target[0])
+    };
+    let next = |est: &mut SetpointEstimator| est.tick(micros(10.0 * PERIOD), DT).1[0];
+    let (mut plain, at) = rising();
+    let free = next(&mut plain);
+    assert!(free > at, "still rising: {at:?} → {free:?}");
+
+    let (mut none, _) = rising();
+    none.condition(None);
+    assert_eq!(next(&mut none), free);
+
+    let (mut behind, _) = rising();
+    behind.condition(Some(roll(at - RotPerSec::new(0.1))));
+    assert!(next(&mut behind) < at, "pulled back");
+
+    let (mut ahead, _) = rising();
+    ahead.condition(Some(roll(at + RotPerSec::new(0.1))));
+    assert_eq!(next(&mut ahead), free, "not pushed forward");
+}
+
 /// A λ of 0 (an unset setting) would freeze the estimate; it tracks with the
 /// default instead.
 #[test]

@@ -1,13 +1,13 @@
 //! Gain data storage and binary format parsing.
 //!
-//! # The `.wfg` gain blob (version 9)
+//! # The `.wfg` gain blob (version 10)
 //!
 //! Every value is little-endian.  The header:
 //!
 //! | Offset | Size | Field          | Description                          |
 //! |--------|------|----------------|--------------------------------------|
 //! | 0x00   | 4    | magic          | `0x4C515247` ("LQRG")                |
-//! | 0x04   | 2    | version        | 9                                    |
+//! | 0x04   | 2    | version        | 10                                   |
 //! | 0x06   | 1    | resolution     | N (grid points per motor axis)       |
 //! | 0x07   | 1    | ff_horizon     | Feedforward horizon h (ticks, ≥ 1)   |
 //! | 0x08   | 4    | min_rps        | `f32` — grid's lowest motor speed    |
@@ -21,18 +21,19 @@
 //!
 //! | Size       | Field          | Description                                   |
 //! |------------|----------------|-----------------------------------------------|
-//! | 4 × 96     | gain quant     | per gain table (ki, kd, kp, binv): `f32[12]` lo, then `f32[12]` step |
+//! | 3 × 96     | gain quant     | per gain table (ki, kd, kp): `f32[12]` lo, then `f32[12]` step |
 //! | 24         | ref constants  | `f32[6]` ad_rr, fh_rr (speed-free)            |
-//! | 352        | ref quant      | `f32[44]` lo, then `f32[44]` step             |
+//! | 448        | ref quant      | `f32[56]` lo, then `f32[56]` step             |
 //! | 64         | affine         | `f32[4×4]` row-major linearizer G             |
 //! | 8          | motor          | `f32[2]` motor drag [k_ω, k_ω²]               |
 //! | 16         | balance        | `f32[4]` hover speed ratio per motor          |
 //! | 20         | drag           | `f32[5]` airframe drag, see [`DRAG_FLOATS`]   |
 //! | 8          | target         | `f32[2]` setpoint target limits               |
 //! | 8          | hover          | `f32[2]` hover rps, integral limit V          |
+//! | 32         | thrust torque  | `f32[2×4]` roll, pitch per signed square, see [`ThrustTorque`] |
 //! | 8          | layout         | `u8[4]` motor positions, `u8[4]` spins, see [`MotorLayout`] |
-//! | N⁴·24 × 4  | gain tables    | per gain table: `u16[N⁴ × 12]` q              |
-//! | N·88       | ref table      | `u16[N × 4 × 11]` q                           |
+//! | N⁴·24 × 3  | gain tables    | per gain table: `u16[N⁴ × 12]` q              |
+//! | N·112      | ref table      | `u16[N × 4 × 14]` q                           |
 //! | 4          | crc32          | CRC32 over every byte before it               |
 //!
 //! The tables are quantized to `u16` to halve their size (they are copied
@@ -49,8 +50,10 @@
 //! gain, follow motor m alone), so it is a 1D table over each motor's speed,
 //! indexed `[grid index · 4 + motor] · REF_MOTOR_SLOTS + slot` (see
 //! [`REF_MOTOR_SLOTS`]).  Multilinear interpolation of such a table is
-//! exactly the 1D interpolation, so nothing is approximated.  At N = 4 the
-//! blob is 25 856 bytes.
+//! exactly the 1D interpolation, so nothing is approximated.  The
+//! feedforward's horizon inverse G_h⁺ is not tabulated: it is computed from
+//! the interpolated G_h (see [`ReferenceModel::horizon_inverse`]).  At N = 4
+//! the blob is 19 840 bytes.
 //!
 //! # Conventions
 //!
@@ -72,8 +75,9 @@ use whippyunits::qty;
 pub const GAIN_MAGIC: u32 = 0x4C51_5247;
 
 /// The format version this crate reads and writes.  Versions 1–8 were in
-/// Betaflight's axes and are not read.
-pub const GAIN_VERSION: u16 = 9;
+/// Betaflight's axes, and 9 lacked the thrust-torque block; neither is read.
+/// Early 10 blobs carried a G_h⁺ table instead of G_h; their size fails.
+pub const GAIN_VERSION: u16 = 10;
 
 /// Floats per grid point in the reference model, assembled from
 /// [`REF_CONST_FLOATS`] and each motor's [`REF_MOTOR_SLOTS`].
@@ -89,10 +93,11 @@ pub const GAIN_VERSION: u16 = 9;
 ///   │  δω' │   │     0       diag(ad_ww)  │ │ δω │   │ diag(bd_w) │
 ///   └      ┘   └   (4×3)        (4×4)     ┘ └    ┘   └   (4×4)    ┘
 ///
-///   h ticks, free response (attitude rows of Ad^h):
+///   h ticks, free response (attitude rows of Ad^h) and forced response to
+///   a voltage held over them (attitude rows of Σ_{i<h} Ad^i·Bd):
 ///
-///   F_h = [ diag(fh_rr)   fh_rw ]
-///           (3×3)        (3×4)
+///   F_h = [ diag(fh_rr)   fh_rw ]        G_h = gh
+///           (3×3)        (3×4)               (3×4)
 /// ```
 ///
 /// The rate→rate and motor→motor blocks are diagonal (rates and motors
@@ -109,7 +114,8 @@ pub const GAIN_VERSION: u16 = 9;
 /// | 31     | `bd_w`  | 4     | one-tick motor speed ← voltage          |
 /// | 35     | `fh_rr` | 3     | h-tick free response, rate ← rate       |
 /// | 38     | `fh_rw` | 3×4   | h-tick free response, rate ← motor speed|
-pub const REF_FLOATS: usize = 50;
+/// | 50     | `gh`    | 3×4   | h-tick forced response, rate ← voltage  |
+pub const REF_FLOATS: usize = 62;
 
 /// Speed-independent reference-model floats: `ad_rr` then `fh_rr`.
 pub const REF_CONST_FLOATS: usize = 6;
@@ -124,7 +130,8 @@ pub const REF_CONST_FLOATS: usize = 6;
 /// | 4–6  | `bd_r[0..3][m]` |
 /// | 7    | `bd_w[m]`      |
 /// | 8–10 | `fh_rw[0..3][m]` |
-pub const REF_MOTOR_SLOTS: usize = 11;
+/// | 11–13 | `gh[0..3][m]`  |
+pub const REF_MOTOR_SLOTS: usize = 14;
 
 /// Width of the reference table's rows: all motors at one grid speed.
 pub const REF_MOTOR_WIDTH: usize = 4 * REF_MOTOR_SLOTS;
@@ -143,6 +150,7 @@ pub fn ref_slots_from_motors(
             r[3 + 4 * i + m] = s[i];
             r[19 + 4 * i + m] = s[4 + i];
             r[38 + 4 * i + m] = s[8 + i];
+            r[50 + 4 * i + m] = s[11 + i];
         }
         r[15 + m] = s[3];
         r[31 + m] = s[7];
@@ -162,6 +170,7 @@ pub struct ReferenceModel {
     pub bd_w: [RpsPerVolt; 4],
     pub fh_rr: [f32; 3],
     pub fh_rw: RateFromSpeedMatrix,
+    pub gh: RateFromVoltMatrix,
 }
 
 impl ReferenceModel {
@@ -173,17 +182,33 @@ impl ReferenceModel {
             })
             .gauge::<AttitudeAxes, MotorSpeedAxes>()
         };
+        let rate_from_volt = |o: usize| {
+            UniformUnitMatrix::<_, SMatrix<f32, 3, 4>>::from_fn(|i, j| RpsPerVolt::new(r[o + 4 * i + j]))
+                .gauge::<AttitudeAxes, MotorAxes>()
+        };
         Self {
             ad_rr: [r[0], r[1], r[2]],
             ad_rw: rate_from_speed(3),
             ad_ww: [r[15], r[16], r[17], r[18]],
-            bd_r: UniformUnitMatrix::<_, SMatrix<f32, 3, 4>>::from_fn(|i, j| {
-                RpsPerVolt::new(r[19 + 4 * i + j])
-            })
-            .gauge::<AttitudeAxes, MotorAxes>(),
+            bd_r: rate_from_volt(19),
             bd_w: [31, 32, 33, 34].map(|o| RpsPerVolt::new(r[o])),
             fh_rr: [r[35], r[36], r[37]],
             fh_rw: rate_from_speed(38),
+            gh: rate_from_volt(50),
+        }
+    }
+
+    /// The feedforward's horizon inverse G_h⁺ = G_hᵀ·(G_h·G_hᵀ)⁻¹: the
+    /// least-norm voltages that move the rates by a given amount over the
+    /// horizon.  G_h is uniform (rot/s per volt), so its Euclidean
+    /// pseudo-inverse is unit-sound.  Zero when G_h has no full row rank (a
+    /// blob without a reference model).
+    pub fn horizon_inverse(&self) -> BInvMatrix {
+        let g = self.gh.to_uniform();
+        let gt = g.transpose();
+        match (g * gt.clone()).try_inverse() {
+            Some(inverse) => (gt * inverse).gauge::<MotorAxes, AttitudeAxes>(),
+            None => BInvMatrix::from_nalgebra(SMatrix::zeros()),
         }
     }
 }
@@ -263,6 +288,26 @@ impl TargetLimits {
 /// detection, and the per-motor integral voltage that trims a generous CG
 /// offset at hover (gen_wfg `build_integral_limit`).  0 when unknown.
 pub const HOVER_FLOATS: usize = 2;
+
+/// Floats in the thrust-torque block: [`ThrustTorque`]'s roll row, then
+/// its pitch row.
+pub const THRUST_TORQUE_FLOATS: usize = 8;
+
+/// Each motor's roll and pitch angular acceleration per signed squared
+/// speed ω|ω| (FRD, by firmware motor): the fitted thrust coefficient times
+/// the motor's lever-arm weight and sign.  The reference model is linear in
+/// motor speed, so it misses the curvature of thrust, k·δω² per motor; this
+/// is what it adds back (see [`crate::controller`]).  Zero leaves it out.
+#[derive(Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub struct ThrustTorque {
+    pub roll: [PerRot; 4],
+    pub pitch: [PerRot; 4],
+}
+
+impl ThrustTorque {
+    pub const ZERO: Self = Self { roll: [PerRot::new(0.0); 4], pitch: [PerRot::new(0.0); 4] };
+}
 
 /// Bytes in the layout block: a [`MotorPosition`] per motor, then a
 /// [`Spin`] per motor.
@@ -363,7 +408,7 @@ impl MotorLayout {
 /// target: the blob is copied to RAM, and at N=5 it is ≈ 63 KB.
 pub const MAX_RESOLUTION: usize = 5;
 
-/// Floats per grid point in each of the 4 gain tables (4 motors × 3 axes).
+/// Floats per grid point in each of the 3 gain tables (4 motors × 3 axes).
 pub const GAIN_SLOTS: usize = 12;
 
 /// Total values per gain table at a given resolution: N⁴ × 4 motors × 3 axes.
@@ -376,8 +421,8 @@ pub const HEADER_SIZE: usize = 0x20;
 
 /// Bytes between the header and the table data.
 const PARAMS_BYTES: usize = 4
-    * (4 * 2 * GAIN_SLOTS + REF_CONST_FLOATS + 2 * REF_MOTOR_WIDTH + AFFINE_FLOATS + MOTOR_FLOATS
-        + BALANCE_FLOATS + DRAG_FLOATS + TARGET_FLOATS + HOVER_FLOATS)
+    * (3 * 2 * GAIN_SLOTS + REF_CONST_FLOATS + 2 * REF_MOTOR_WIDTH + AFFINE_FLOATS + MOTOR_FLOATS
+        + BALANCE_FLOATS + DRAG_FLOATS + TARGET_FLOATS + HOVER_FLOATS + THRUST_TORQUE_FLOATS)
     + LAYOUT_BYTES;
 
 /// Byte offset of the layout block, the last before the table data.
@@ -385,7 +430,7 @@ pub const LAYOUT_OFFSET: usize = HEADER_SIZE + PARAMS_BYTES - LAYOUT_BYTES;
 
 /// Size of a blob of resolution `n`.
 pub const fn blob_size(n: usize) -> usize {
-    HEADER_SIZE + PARAMS_BYTES + 2 * (4 * table_values(n) + n * REF_MOTOR_WIDTH) + 4
+    HEADER_SIZE + PARAMS_BYTES + 2 * (3 * table_values(n) + n * REF_MOTOR_WIDTH) + 4
 }
 
 // Tables are read in place as native f32/u16, which must match the blob's
@@ -486,12 +531,11 @@ pub struct GainStorage {
     pub header: GainHeader,
     pub loaded: bool,
 
-    // The 4 gain tables, each N⁴ × 12 values.  Indexed as
+    // The 3 gain tables, each N⁴ × 12 values.  Indexed as
     // [((m0·N + m1)·N + m2)·N + m3] * 12 + motor * 3 + axis
     pub ki: GainTable<VoltPerRot>,
     pub kd: GainTable<VoltPerRpsPerSec>,
     pub kp: GainTable<VoltPerRps>,
-    pub binv: GainTable<VoltPerRps>,
 
     /// Reference-model table, per motor (see [`REF_MOTOR_SLOTS`]).
     pub ref_model: GainTable<f32>,
@@ -520,6 +564,9 @@ pub struct GainStorage {
     /// Per-motor integral voltage bound, see [`HOVER_FLOATS`].
     pub integral_limit_v: Volt,
 
+    /// Thrust torque per signed squared speed, see [`ThrustTorque`].
+    pub thrust_torque: ThrustTorque,
+
     /// The airframe's motors, by the firmware's motor index.
     pub layout: MotorLayout,
 }
@@ -540,7 +587,6 @@ impl GainStorage {
             ki: GainTable::EMPTY,
             kd: GainTable::EMPTY,
             kp: GainTable::EMPTY,
-            binv: GainTable::EMPTY,
             ref_model: GainTable::EMPTY,
             ref_const: [0.0; REF_CONST_FLOATS],
             affine: [VoltPerRpsSq::new(0.0); AFFINE_FLOATS],
@@ -550,6 +596,7 @@ impl GainStorage {
             target_limits: TargetLimits::DEFAULT,
             hover_rps: RotPerSec::new(0.0),
             integral_limit_v: Volt::new(0.0),
+            thrust_torque: ThrustTorque::ZERO,
             layout: MotorLayout {
                 position: MotorPosition::ALL,
                 spin: [Spin::Clockwise, Spin::CounterClockwise, Spin::CounterClockwise, Spin::Clockwise],
@@ -642,6 +689,43 @@ pub fn static_blob(bytes: &[u8]) -> &'static [u8] {
     buf
 }
 
+/// Which of a blob's feedback gains to keep.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FeedbackTerms {
+    pub p: bool,
+    pub i: bool,
+    pub d: bool,
+}
+
+impl FeedbackTerms {
+    pub const ALL: Self = Self { p: true, i: true, d: true };
+    pub const NONE: Self = Self { p: false, i: false, d: false };
+}
+
+/// `blob` with the feedback gains `keep` leaves out zeroed and the CRC
+/// updated, for flying part of the controller in simulation ([`FeedbackTerms::NONE`]
+/// for the feedforward alone).  A table's quant block is zeroed, so its every
+/// entry decodes to 0.  A blob too short to hold them is returned as is, for
+/// [`load_gains`] to reject.
+#[cfg(feature = "std")]
+pub fn with_feedback(blob: &[u8], keep: FeedbackTerms) -> std::vec::Vec<u8> {
+    let mut out = blob.to_vec();
+    let block = 4 * 2 * GAIN_SLOTS;
+    if out.len() < HEADER_SIZE + 3 * block + 4 {
+        return out;
+    }
+    for (k, kept) in [keep.i, keep.d, keep.p].into_iter().enumerate() {
+        if !kept {
+            let start = HEADER_SIZE + k * block;
+            out[start..start + block].fill(0);
+        }
+    }
+    let payload = out.len() - 4;
+    let crc = crc32(&out[..payload]);
+    out[payload..].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
 /// Parse and validate a gain binary blob, pointing `storage` at its tables.
 ///
 /// The tables are not copied: `data` must stay valid and unmodified for the
@@ -690,7 +774,6 @@ pub fn load_gains(data: &'static [u8], storage: &mut GainStorage) -> GainLoadRes
     let ki_q = cur.quant(GAIN_SLOTS);
     let kd_q = cur.quant(GAIN_SLOTS);
     let kp_q = cur.quant(GAIN_SLOTS);
-    let binv_q = cur.quant(GAIN_SLOTS);
     let ref_const: &[f32] = cur.take(REF_CONST_FLOATS);
     let ref_q = cur.quant(REF_MOTOR_WIDTH);
     let affine: &[VoltPerRpsSq] = cur.take(AFFINE_FLOATS);
@@ -704,6 +787,10 @@ pub fn load_gains(data: &'static [u8], storage: &mut GainStorage) -> GainLoadRes
     let target_limits = TargetLimits { slew: cur.one(), jerk: cur.one() };
     let hover_rps = cur.one();
     let integral_limit_v = cur.one();
+    let thrust_torque = ThrustTorque {
+        roll: core::array::from_fn(|_| cur.one()),
+        pitch: core::array::from_fn(|_| cur.one()),
+    };
     let codes: &[u8] = cur.take(LAYOUT_BYTES);
     let Some(layout) = MotorLayout::from_codes(&core::array::from_fn(|i| codes[i])) else {
         return GainLoadResult::BadLayout;
@@ -715,7 +802,6 @@ pub fn load_gains(data: &'static [u8], storage: &mut GainStorage) -> GainLoadRes
     storage.ki = table(&mut cur, ki_q, n);
     storage.kd = table(&mut cur, kd_q, n);
     storage.kp = table(&mut cur, kp_q, n);
-    storage.binv = table(&mut cur, binv_q, n);
     storage.ref_model = table(&mut cur, ref_q, resolution * REF_MOTOR_WIDTH);
     storage.ref_const.copy_from_slice(ref_const);
     storage.affine.copy_from_slice(affine);
@@ -726,6 +812,7 @@ pub fn load_gains(data: &'static [u8], storage: &mut GainStorage) -> GainLoadRes
     storage.target_limits = target_limits;
     storage.hover_rps = hover_rps;
     storage.integral_limit_v = integral_limit_v;
+    storage.thrust_torque = thrust_torque;
     storage.layout = layout;
 
     storage.loaded = true;
@@ -753,7 +840,6 @@ pub mod spec {
         pub ki: Vec<f32>,
         pub kd: Vec<f32>,
         pub kp: Vec<f32>,
-        pub binv: Vec<f32>,
         pub ref_const: [f32; REF_CONST_FLOATS],
         /// N × 4 × [`REF_MOTOR_SLOTS`].
         pub ref_motor: Vec<f32>,
@@ -763,6 +849,7 @@ pub mod spec {
         pub airframe_drag: [f32; DRAG_FLOATS],
         pub target_limits: [f32; TARGET_FLOATS],
         pub hover: [f32; HOVER_FLOATS],
+        pub thrust_torque: [f32; THRUST_TORQUE_FLOATS],
         pub layout: MotorLayout,
     }
 
@@ -783,7 +870,6 @@ pub mod spec {
                 ki: std::vec![0.0; table_values(n)],
                 kd: std::vec![0.0; table_values(n)],
                 kp: std::vec![0.0; table_values(n)],
-                binv: std::vec![0.0; table_values(n)],
                 ref_const: [1.0; REF_CONST_FLOATS],
                 ref_motor: std::vec![0.0; n * REF_MOTOR_WIDTH],
                 affine: [0.0; AFFINE_FLOATS],
@@ -792,6 +878,7 @@ pub mod spec {
                 airframe_drag: [0.0; DRAG_FLOATS],
                 target_limits: [0.0; TARGET_FLOATS],
                 hover: [0.0; HOVER_FLOATS],
+                thrust_torque: [0.0; THRUST_TORQUE_FLOATS],
                 layout: GainStorage::new().layout,
             }
         }
@@ -810,7 +897,6 @@ pub mod spec {
                 quantize(&self.ki, GAIN_SLOTS),
                 quantize(&self.kd, GAIN_SLOTS),
                 quantize(&self.kp, GAIN_SLOTS),
-                quantize(&self.binv, GAIN_SLOTS),
                 quantize(&self.ref_motor, REF_MOTOR_WIDTH),
             ];
             let mut out = Vec::with_capacity(blob_size(n));
@@ -823,7 +909,7 @@ pub mod spec {
             f32s(&mut out, &[self.min_rps, self.max_rps, self.dt, self.integral_tau, self.derivative_tau]);
             out.extend_from_slice(&(blob_size(n) as u32).to_le_bytes());
             for (k, (lo, step, _)) in quantized.iter().enumerate() {
-                if k == 4 {
+                if k == 3 {
                     f32s(&mut out, &self.ref_const);
                 }
                 f32s(&mut out, lo);
@@ -835,6 +921,7 @@ pub mod spec {
             f32s(&mut out, &self.airframe_drag);
             f32s(&mut out, &self.target_limits);
             f32s(&mut out, &self.hover);
+            f32s(&mut out, &self.thrust_torque);
             out.extend_from_slice(&self.layout.to_codes());
             for (_, _, q) in &quantized {
                 q.iter().for_each(|v| out.extend_from_slice(&v.to_le_bytes()));

@@ -176,6 +176,8 @@ pub type MetersPerSecSq = qty!(m / s ^ 2, f32);
 pub type DecaMetersPerSecSq = qty!(dam / s ^ 2, f32);
 /// Angular acceleration per specific force, rot/m (airframe drag).
 pub type RotPerMeter = qty!(rot / m, f32);
+/// Angular acceleration per signed squared speed, 1/rot (thrust torque).
+pub type PerRot = qty!(1 / rot, f32);
 
 /// Standard gravity g₀.
 pub const STANDARD_GRAVITY: MetersPerSecSq = mps2(quantity!(1.0, g_n, f32));

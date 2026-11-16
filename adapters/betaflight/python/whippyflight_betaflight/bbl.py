@@ -486,9 +486,15 @@ def read_logs(path, cache=True):
     """Decode every log in a blackbox file (memoized in ~/.cache by path, size and mtime)."""
     if cache:
         cp = _cache_path(path)
-        if os.path.exists(cp):
+        # An entry that no longer unpickles (e.g. pickled by an older layout of
+        # this package) is a miss.
+        try:
             with open(cp, "rb") as f:
                 return pickle.load(f)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            os.remove(cp)
     logs = _read_logs(path)
     if cache:
         os.makedirs(CACHE_DIR, exist_ok=True)
