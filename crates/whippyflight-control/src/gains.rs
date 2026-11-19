@@ -1,13 +1,13 @@
 //! Gain data storage and binary format parsing.
 //!
-//! # The `.wfg` gain blob (version 10)
+//! # The `.wfg` gain blob (version 11)
 //!
 //! Every value is little-endian.  The header:
 //!
 //! | Offset | Size | Field          | Description                          |
 //! |--------|------|----------------|--------------------------------------|
 //! | 0x00   | 4    | magic          | `0x4C515247` ("LQRG")                |
-//! | 0x04   | 2    | version        | 10                                   |
+//! | 0x04   | 2    | version        | 11                                   |
 //! | 0x06   | 1    | resolution     | N (grid points per motor axis)       |
 //! | 0x07   | 1    | ff_horizon     | Feedforward horizon h (ticks, ≥ 1)   |
 //! | 0x08   | 4    | min_rps        | `f32` — grid's lowest motor speed    |
@@ -76,8 +76,10 @@ pub const GAIN_MAGIC: u32 = 0x4C51_5247;
 
 /// The format version this crate reads and writes.  Versions 1–8 were in
 /// Betaflight's axes, and 9 lacked the thrust-torque block; neither is read.
-/// Early 10 blobs carried a G_h⁺ table instead of G_h; their size fails.
-pub const GAIN_VERSION: u16 = 10;
+/// 10's integral state was dt/τ_int times this one and its Ki that much
+/// larger, so a 10 blob would integrate τ_int/dt times too hard; it isn't
+/// read either.
+pub const GAIN_VERSION: u16 = 11;
 
 /// Floats per grid point in the reference model, assembled from
 /// [`REF_CONST_FLOATS`] and each motor's [`REF_MOTOR_SLOTS`].

@@ -287,7 +287,7 @@ pub struct LqrTelemetry {
     pub error_prop: [RotPerSec; 3],
     /// Integral error state: [roll, pitch, yaw] in rot.
     pub error_integral: [Rotation; 3],
-    /// The integral state over the loop period, e_int/dt: the rate error
+    /// The integral state over its time constant, e_int/τ_int: the rate error
     /// low-passed over the integral's time constant, in rot/s.
     pub error_integral_rate: [RotPerSec; 3],
     /// Derivative error state: [roll, pitch, yaw] in rot/s².

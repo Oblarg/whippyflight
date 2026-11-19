@@ -113,7 +113,7 @@ fn real_gains_load_successfully() {
     let max_rps: Rate = gains.header.max_rps.lossy_into();
     assert!(max_rps > 1.5 * common::plant::model().hover_rps);
     assert!((gains.header.dt - Seconds::new(0.00025)).abs() < Seconds::new(1e-6));
-    assert!((gains.header.integral_tau - Seconds::new(10.0)).abs() < Seconds::new(0.01));
+    assert!((gains.header.integral_tau - Seconds::new(5.0)).abs() < Seconds::new(0.01));
     assert!((gains.header.derivative_tau - Seconds::new(0.02)).abs() < Seconds::new(0.01));
 }
 
@@ -392,9 +392,8 @@ fn reset_clears_integral_and_derivative_state() {
     }
 
     let pre_integral_mag = magnitude(ctrl.telemetry().error_integral);
-    // 500 ticks of a 0.02 rot/s error, each adding (dt/τ_int)·dt·e; allow half.
-    let dt = gains.header.dt;
-    let expected = 500.0 * f32::from(dt / gains.header.integral_tau) * dt * error;
+    // 500 ticks of a 0.02 rot/s error, each adding dt·e; allow half.
+    let expected = 500.0 * gains.header.dt * error;
     assert!(pre_integral_mag > 0.5 * expected, "No integral buildup before reset");
 
     // Reset

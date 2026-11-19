@@ -158,7 +158,7 @@ fn reject_bad_magic() {
 
 #[test]
 fn reject_other_versions() {
-    for version in [1u16, 8, 9, 11, 99] {
+    for version in [1u16, 8, 9, 10, 12, 99] {
         let mut blob = make_gain_blob(2, 1.0);
         blob[4..6].copy_from_slice(&version.to_le_bytes());
         refresh_crc(&mut blob);

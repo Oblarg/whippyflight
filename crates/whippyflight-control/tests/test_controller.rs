@@ -200,13 +200,13 @@ fn integrator_clamps() {
     let sensors = make_sensors([0.0; 3].map(RotPerSec::new), BATTERY);
     let setpoint = make_setpoint([100.0, 0.0, 0.0].map(RotPerSec::new), 0.5); // huge error
 
-    // Run many iterations — integrator should clamp at ±0.25 rot/s·dt
+    // Run many iterations — integrator should clamp at ±0.25 rot/s·τ_int
     for _ in 0..10000 {
         ctrl.update(&sensors, &setpoint, &gains);
     }
 
     let integral = ctrl.telemetry().error_integral[0];
-    let limit = RotPerSec::new(0.25) * DT;
+    let limit = RotPerSec::new(0.25) * gains.header.integral_tau;
     assert!(
         (integral - limit).abs() <= Rotation::new(1e-9),
         "integral should clamp at {limit:?}, got {:?}",

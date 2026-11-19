@@ -304,17 +304,20 @@ impl ControllerState {
         // Setpoint diff for feedforward: Δr = r[k] - r[k-1]  (rot/s)
         let setpoint_diff: SetpointDiffVec = setpoint_vec - self.prev_setpoint;
 
-        // Leaky integrator: e_int[k] = (1-α)·e_int[k-1] + α·dt·e[k]  (rot)
+        // Leaky integrator: e_int[k] = (1-α)·e_int[k-1] + dt·e[k]  (rot), the
+        // error's integral over spans short against τ_int; a held error
+        // settles at τ_int·e.
         //
         // Must match gen_wfg.py's augmented model (A_aug rows 0–2), which Ki
-        // was solved against.  The clamp bounds the low-passed error e_int/dt
-        // at INTEGRAL_ERROR_RATE_LIMIT.  While the last command was
-        // saturated, or on the ground, the error isn't correctable, so the
-        // state only leaks (anti-windup).
-        let int_gain = if self.saturated || !self.airborne { Seconds::new(0.0) } else { dt * alpha_int };
+        // was solved against.  The clamp bounds the low-passed error
+        // e_int/τ_int at INTEGRAL_ERROR_RATE_LIMIT.  While the last command
+        // was saturated, or on the ground, the error isn't correctable, so
+        // the state only leaks (anti-windup).
+        let tau_int = gains.header.integral_tau;
+        let int_gain = if self.saturated || !self.airborne { Seconds::new(0.0) } else { dt };
         let int_raw: IntegralErrorVec =
             self.integral_error.scale(1.0 - alpha_int) + prop_error * int_gain;
-        let int_limit = INTEGRAL_ERROR_RATE_LIMIT * dt;
+        let int_limit = INTEGRAL_ERROR_RATE_LIMIT * tau_int;
         self.integral_error =
             from_array(to_array(&int_raw).map(|x| x.clamp(-int_limit, int_limit)));
 
@@ -433,7 +436,7 @@ impl ControllerState {
             affine_v: to_array(&affine),
             error_prop: to_array(&prop_error),
             error_integral: to_array(&self.integral_error),
-            error_integral_rate: to_array(&self.integral_error).map(|x| x / dt),
+            error_integral_rate: to_array(&self.integral_error).map(|x| x / tau_int),
             error_derivative: to_array(&self.derivative_error),
             kp_motor0: [kp.get(0, 0), kp.get(0, 1), kp.get(0, 2)],
             collective_v: alloc.collective_v,
@@ -622,7 +625,7 @@ impl ControllerState {
 #[cfg(feature = "airframe-drag")]
 const DRAG_ACCEL_LIMIT: MetersPerSecSq = mps2(quantity!(3.0, g_n, f32));
 
-/// Bound on the integral state's low-passed error e_int/dt.
+/// Bound on the integral state's low-passed error e_int/τ_int.
 const INTEGRAL_ERROR_RATE_LIMIT: RotPerSec = RotPerSec::new(0.25);
 
 /// Battery reading below which the controller assumes this voltage (a

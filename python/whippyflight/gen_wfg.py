@@ -33,7 +33,7 @@ from whippyflight import coefficients
 
 # ── .wfg format constants ────────────────────────────────────────────────
 MAGIC       = 0x4C515247   # "LQRG" little-endian
-VERSION     = 10
+VERSION     = 11
 HEADER_SIZE = 0x20
 
 # Reference-model table, per grid point (FRD axes, motors by index):
@@ -457,9 +457,9 @@ def augmented_system(omegas, coeffs, w, dt, tau_int, tau_deriv):
     A_aug_top[0, 0] = 1 - alpha
     A_aug_top[1, 1] = 1 - alpha
     A_aug_top[2, 2] = 1 - alpha
-    A_aug_top[0, 9]  = alpha * dt
-    A_aug_top[1, 10] = alpha * dt
-    A_aug_top[2, 11] = alpha * dt
+    A_aug_top[0, 9]  = dt
+    A_aug_top[1, 10] = dt
+    A_aug_top[2, 11] = dt
     # Derivative filters (rows 3–5)
     A_aug_top[3, 3] = 1 - alpha_d
     A_aug_top[4, 4] = 1 - alpha_d
@@ -506,18 +506,18 @@ def lqr_weights(sigma_int, sigma_deriv, sigma_rate, sigma_volt):
 TRIM_CG_ARM_FRACTION = 0.25
 
 
-def build_integral_limit(coeffs, w, hover_rps, dt, ki_py, kp_py, min_rps, max_rps):
+def build_integral_limit(coeffs, w, hover_rps, tau_int, ki_py, kp_py, min_rps, max_rps):
     """
     Per-motor integral voltage bound (V): the largest feedback voltage on
     any motor once the controller has trimmed a TRIM_CG_ARM_FRACTION CG
     offset on pitch or on roll, from a torque-free hover.
 
-    At that steady state the leaky integral holds z = dt·e for a residual
-    rate error e, and the feedback is (Ki·dt + Kp)·e; with the affine
+    At that steady state the leaky integral holds z = τ_int·e for a residual
+    rate error e, and the feedback is (Ki·τ_int + Kp)·e; with the affine
     linearizer and the hover collective it holds motor speeds ω whose
     torques cancel the offset's k_T·e·Σω_h² on that axis and nothing on the
-    others:  k_ω·ω + k_ω²·ω|ω| = (Ki·dt + Kp)·e + G·ω|ω| + v_c.  Solved
-    for (ω, e); the bound is the largest |Ki·dt·e|.
+    others:  k_ω·ω + k_ω²·ω|ω| = (Ki·τ_int + Kp)·e + G·ω|ω| + v_c.  Solved
+    for (ω, e); the bound is the largest |Ki·τ_int·e|.
     The lever arms, hover speeds and the LQR's split across motors make
     this airframe-specific (the back motors of a long-tailed frame carry
     most of a pitch trim).
@@ -535,7 +535,7 @@ def build_integral_limit(coeffs, w, hover_rps, dt, ki_py, kp_py, min_rps, max_rp
 
     def gains_at(om):
         p = np.clip(om, min_rps, max_rps)[None, :]
-        return ki_grid(p)[0] * dt, kp_grid(p)[0]
+        return ki_grid(p)[0] * tau_int, kp_grid(p)[0]
 
     G = build_affine_linearizer(coeffs, w)
     k_w, k_w2 = build_motor_drag(coeffs)
@@ -561,21 +561,21 @@ def build_integral_limit(coeffs, w, hover_rps, dt, ki_py, kp_py, min_rps, max_rp
             # held fixed within each solve.)
             x = np.concatenate([hover, np.zeros(3)])
             for _ in range(5):
-                ki_dt, kp = gains_at(x[0:4])
+                ki_tau, kp = gains_at(x[0:4])
 
                 def residual(x):
                     om, e = x[0:4], x[4:7]
-                    return np.concatenate([volts(om) - (ki_dt + kp) @ e - G @ (om * np.abs(om)) - v_c,
+                    return np.concatenate([volts(om) - (ki_tau + kp) @ e - G @ (om * np.abs(om)) - v_c,
                                            (torque(om) - want) / (k_T * np.sum(hover ** 2))])
 
                 x, info, ok, msg = fsolve(residual, x, full_output=True)
                 assert ok == 1, f"integral limit: trim solve failed: {msg}"
-            worst = max(worst, np.abs(ki_dt @ x[4:7]).max())
+            worst = max(worst, np.abs(ki_tau @ x[4:7]).max())
     return worst
 
 
 def solve_gain_grid(coeffs, w, resolution, min_rps, max_rps, dt, tau_int, tau_deriv,
-                    ff_horizon, sigma_int=1e-4, sigma_deriv=20.0, sigma_rate=1.0, sigma_volt=1.0,
+                    ff_horizon, sigma_int=0.06, sigma_deriv=20.0, sigma_rate=1.0, sigma_volt=1.0,
                     structured=False):
     """
     Solve DARE at each point on the N⁴ motor-speed grid.
@@ -803,8 +803,8 @@ def parse_args(argv=None):
     parser.add_argument("--dt", type=float, default=None,
                         help="Loop period in seconds (default: 1/airframe.loop_hz, else "
                              "0.00025 = 4 kHz)")
-    parser.add_argument("--tau-int", type=float, default=10.0,
-                        help="Integral time constant (default: 10.0)")
+    parser.add_argument("--tau-int", type=float, default=5.0,
+                        help="Integral leak time constant, s (default: 5.0)")
     parser.add_argument("--tau-deriv", type=float, default=0.02,
                         help="Derivative smoothing time constant (default: 0.02)")
     parser.add_argument("--d-front", type=float, default=None,
@@ -815,9 +815,9 @@ def parse_args(argv=None):
                         help="Left lever arm, for a fit without fitted arms (default: 1.0)")
     parser.add_argument("--d-right", type=float, default=None,
                         help="Right lever arm, for a fit without fitted arms (default: 1.0)")
-    parser.add_argument("--sigma-int", type=float, default=0.012,
-                        help="LQR: allowed low-passed rate error the integral holds, rot/s "
-                             "(the state is dt × that, so its weight is σ·dt; default: 0.012)")
+    parser.add_argument("--sigma-int", type=float, default=0.06,
+                        help="LQR: allowed integral-state excursion, rot: the attitude error the "
+                             "integral holds (default: 0.06)")
     parser.add_argument("--sigma-deriv", type=float, default=15.0,
                         help="LQR: allowed derivative-state excursion, rot/s² (default: 15.0)")
     parser.add_argument("--sigma-rate", type=float, default=5.0,
@@ -852,29 +852,28 @@ def parse_args(argv=None):
     return args
 
 
-def generate(args):
-    """Solve and pack the blob `args` describe (filling in their defaults that
-    depend on the airframe); returns it and the gain tables at the grid points."""
-    print(f"Loading coefficients from {args.coefficients}", file=sys.stderr)
-    with open(args.coefficients, 'r') as f:
+def load_coefficients(path):
+    """The fit at `path`, normalized to the canonical frame."""
+    print(f"Loading coefficients from {path}", file=sys.stderr)
+    with open(path, 'r') as f:
         raw = json.load(f)
     if raw.get('motor_speed') != MOTOR_SPEED_UNIT or 'airframe' not in raw:
-        sys.exit(f"{args.coefficients} was fitted before motor speeds were in "
+        sys.exit(f"{path} was fitted before motor speeds were in "
                  f"{MOTOR_SPEED_UNIT}; fit it again with fit_model.py")
     try:
         coeffs = coefficients.normalize(raw)
     except coefficients.FrameError as e:
-        sys.exit(f"{args.coefficients}: {e}")
+        sys.exit(f"{path}: {e}")
     if coefficients.is_legacy(raw):
         print("  (legacy Betaflight fit: converted to the canonical frame)", file=sys.stderr)
-    perm, spins = coefficients.layout(coeffs)
-    print(f"Motors by firmware index: " + ", ".join(
-        f"{m['position']} {m['spin']}" for m in coeffs['frame']['motors']), file=sys.stderr)
+    return coeffs
 
-    cells, hover_rps, loop_hz = operating_point(coeffs)
-    vbat_full = cells * FULL_CELL_V
+
+def fill_defaults(args, coeffs):
+    """Fill in `args`' defaults that depend on the airframe."""
+    cells, _, loop_hz = operating_point(coeffs)
     if args.max_rps is None:
-        args.max_rps = 10 * math.ceil(steady_speed(coeffs, vbat_full) / 10)
+        args.max_rps = 10 * math.ceil(steady_speed(coeffs, cells * FULL_CELL_V) / 10)
         if args.max_rps <= args.min_rps:
             sys.exit(f"the grid's bottom, {args.min_rps:g} rev/s, is at or above the motors' "
                      f"full-battery speed, {args.max_rps:g}")
@@ -882,6 +881,26 @@ def generate(args):
         args.dt = 1.0 / loop_hz
     if args.sigma_volt is None:
         args.sigma_volt = 1.0 * cells
+
+
+def applied_gains(A, B, Q_elems, R_elems, structured):
+    """The LQR gains with only the columns the firmware applies."""
+    K = solve_gains(A, B, Q_elems, R_elems, structured)
+    S = np.eye(A.shape[0])[APPLIED_COLUMNS]
+    return K @ S.T @ S
+
+
+def generate(args):
+    """Solve and pack the blob `args` describe (filling in their defaults that
+    depend on the airframe); returns it and the gain tables at the grid points."""
+    coeffs = load_coefficients(args.coefficients)
+    perm, spins = coefficients.layout(coeffs)
+    print(f"Motors by firmware index: " + ", ".join(
+        f"{m['position']} {m['spin']}" for m in coeffs['frame']['motors']), file=sys.stderr)
+
+    cells, hover_rps, _ = operating_point(coeffs)
+    vbat_full = cells * FULL_CELL_V
+    fill_defaults(args, coeffs)
     print(f"Airframe: {cells}S ({vbat_full:.1f} V full), hover {hover_rps:.0f} rev/s; "
           f"grid {args.min_rps:.0f}–{args.max_rps:.0f} rev/s, dt {args.dt * 1e6:.1f} µs, "
           f"σ_volt {args.sigma_volt:.2f} V", file=sys.stderr)
@@ -894,7 +913,7 @@ def generate(args):
     ki_py, kd_py, kp_py, binv_py, ref_py = solve_gain_grid(
         coeffs, w, args.resolution, args.min_rps, args.max_rps,
         args.dt, args.tau_int, args.tau_deriv, args.ff_horizon,
-        args.sigma_int * args.dt, args.sigma_deriv, args.sigma_rate, args.sigma_volt,
+        args.sigma_int, args.sigma_deriv, args.sigma_rate, args.sigma_volt,
         args.structured)
 
     print("Remapping to the firmware's motor order, FRD axes...", file=sys.stderr)
@@ -916,7 +935,7 @@ def generate(args):
     print(f"Target limits: slew {target_limits[0]:.1f} rot/s², jerk {target_limits[1]:.0f} rot/s³",
           file=sys.stderr)
     integral_limit_v = build_integral_limit(
-        coeffs, w, hover_rps, args.dt, ki_py, kp_py, args.min_rps, args.max_rps)
+        coeffs, w, hover_rps, args.tau_int, ki_py, kp_py, args.min_rps, args.max_rps)
     print(f"Integral voltage bound: {integral_limit_v:.3f} V "
           f"({TRIM_CG_ARM_FRACTION:.0%}-of-arm CG offset)", file=sys.stderr)
 

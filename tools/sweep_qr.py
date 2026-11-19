@@ -29,7 +29,7 @@ GEN_WFG = [sys.executable, "-m", "whippyflight.gen_wfg"]
 
 SIGMA_RATE = [1.0, 2.0, 5.0, 20.0]
 SIGMA_DERIV = [5.0, 7.0, 10.0, 15.0, 20.0, 30.0]
-SIGMA_INT = [0.004, 0.008, 0.012, 0.02, 0.04]  # rot/s (gen_wfg --sigma-int)
+SIGMA_INT = [0.02, 0.04, 0.06, 0.1, 0.2]  # rot (gen_wfg --sigma-int)
 
 EVALS = {"eval_gyro_filter": "lag_margin_summary", "eval_feedforward": "flick_summary"}
 CARGO = ["cargo", "test", "--release", "-p", "whippyflight-sim",
@@ -84,7 +84,7 @@ def main():
     ap.add_argument("--sigma-rate", type=float, nargs="+", default=SIGMA_RATE)
     ap.add_argument("--sigma-deriv", type=float, nargs="+", default=SIGMA_DERIV)
     ap.add_argument("--sigma-int", type=float, nargs="+", default=SIGMA_INT)
-    ap.add_argument("--tau-int", type=float, nargs="+", default=[10.0])
+    ap.add_argument("--tau-int", type=float, nargs="+", default=[5.0])
     ap.add_argument("--tau-deriv", type=float, nargs="+", default=[0.02])
     ap.add_argument("--gen-args", default="",
                     help="extra gen_wfg.py arguments, e.g. '--ff-horizon 16'")
