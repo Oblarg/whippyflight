@@ -13,7 +13,17 @@ Writes OUT_DIR/occupancy.png: per motor, the flight time over its own speed
 and the other three's mean (the axes of plot_gains' lattices), and over the
 spread of the four speeds; and OUT_DIR/deviation.png: per axis, a line per
 gain, the fraction of flight time the scheduled gains differ from hover's by
-more than a given amount, as ‖K(ω) − K(hover)‖ / ‖K(hover)‖ over the four motors.
+more than a given amount, as ‖K(ω) − K(hover)‖ / ‖K(hover)‖ over the four motors;
+and OUT_DIR/deviation_ff.png: the same for the feedforward's horizon inverse:
+its rate feedforward G_h⁺, the voltages per rate change wanted over the horizon,
+and its acceleration feedforward G_h⁺·F_h,ω, each axis's share of cancelling
+the motor speeds' free response.  Inverting motors that lag behind an
+integrator takes a term on the setpoint's rate of change and one on its
+acceleration; Betaflight's feedforward and feedforward boost are those terms at
+fixed gains, which these correspond to.  And OUT_DIR/deviation_affine.png:
+the fraction of flight time the affine linearizer's voltage u_aff = G·ω|ω|,
+which Betaflight has no counterpart of, differs from hover's by more than a
+given amount, over the four motors.
 Speeds off the grid clamp to it, as the firmware's do.  Needs matplotlib.
 """
 
@@ -29,6 +39,8 @@ from whippyflight_betaflight.fit_model import load_flights, shaft_rps
 # Relative gain deviations the summaries count flight time beyond.
 THRESHOLDS = (0.1, 0.25, 0.5)
 BINS = 80
+# (style, width) per deviation line, so lines that coincide stay visible.
+LINES = [("-", 3.0), ("--", 1.8), (":", 1.6), ("-.", 1.4)]
 
 
 def flight_speeds(specs, motor_poles=None):
@@ -112,33 +124,71 @@ def plot_occupancy(blob, rps, dt, out_dir, title):
     return path
 
 
-def plot_deviation(dev, dt, out_dir, title):
-    """Write deviation.png; returns its path."""
+def ff_deviations(blob, clamped):
+    """[sample, gain, axis] relative distance of the feedforward's gains (plot_gains.FF_GAINS)
+    from hover's."""
+    hover = pg.ff_gains(blob, np.full((1, 4), blob["hover_rps"]))
+    out = np.empty((len(clamped), len(pg.FF_GAINS), 3))
+    for k, (gain, at_hover) in enumerate(zip(pg.ff_gains(blob, clamped), hover)):
+        gain, at_hover = gain.reshape(len(gain), 3, -1), at_hover.reshape(1, 3, -1)
+        out[:, k, :] = np.linalg.norm(gain - at_hover, axis=2) / np.linalg.norm(at_hover, axis=2)
+    return out
+
+
+def survival(ax, d, dt, style, label):
+    """Draw the fraction of flight time `dt` per sample that `d` exceeds, over `d` (%), with
+    the time beyond THRESHOLDS in the label."""
+    order = np.argsort(d)
+    past = 1.0 - np.cumsum(dt[order]) / dt.sum()
+    beyonds = " / ".join(f"{100 * beyond(d, dt, t):.0f}" for t in THRESHOLDS)
+    ax.plot(100 * d[order], 100 * past, lw=style[1], ls=style[0], label=f"{label}: {beyonds}%")
+
+
+def threshold_legend(ax):
+    ax.legend(title="time beyond " + " / ".join(f"{100 * t:.0f}" for t in THRESHOLDS) + "%",
+              fontsize=8, title_fontsize=8)
+
+
+def plot_affine(blob, clamped, dt, path, what):
+    """Write the affine linearizer's voltage over the flight to `path`, titled `what`:
+    its deviation from hover's over the four motors; returns `path`."""
+    plt = pg.pyplot()
+    volts = pg.affine_voltage(blob, clamped)
+    at_hover = pg.affine_voltage(blob, np.full((1, 4), blob["hover_rps"]))[0]
+    dev = np.linalg.norm(volts - at_hover, axis=1) / np.linalg.norm(at_hover)
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    survival(ax, dev, dt, LINES[0], "u_aff")
+    ax.set_xlim(0, 100 * max(quantile(dev, dt, 0.999), THRESHOLDS[-1]) * 1.05)
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("‖u_aff(ω) − u_aff(hover)‖ / ‖u_aff(hover)‖ over the four motors (%)", fontsize=8)
+    ax.set_ylabel("flight time beyond it (%)", fontsize=8)
+    threshold_legend(ax)
+    fig.suptitle(what, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
+
+
+def plot_deviation(dev, names, dt, path, what):
+    """Write the deviations `dev` [sample, gain, axis] of the gains `names` to `path`, titled
+    `what`; returns `path`."""
     plt = pg.pyplot()
     top = max(max(quantile(dev[:, g, a], dt, 0.999) for g in range(dev.shape[1]) for a in range(3)),
               THRESHOLDS[-1])
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), sharex=True, sharey=True, squeeze=False)
     for col, axis in enumerate(pg.AXES):
         ax = axes[0, col]
-        for t in THRESHOLDS:
-            ax.axvline(100 * t, color="0.6", ls=":", lw=1)
-        for row, (name, _) in enumerate(pg.GAINS):
-            d = dev[:, row, col]
-            order = np.argsort(d)
-            past = 1.0 - np.cumsum(dt[order]) / dt.sum()
-            beyonds = " / ".join(f"{100 * beyond(d, dt, t):.0f}" for t in THRESHOLDS)
-            ax.plot(100 * d[order], 100 * past, lw=1.6, label=f"{name}: {beyonds}%")
+        for row, name in enumerate(names):
+            survival(ax, dev[:, row, col], dt, LINES[row], name)
         ax.set_xlim(0, 100 * top * 1.05)
         ax.set_ylim(0, 100)
         ax.set_title(axis, fontsize=10)
         ax.set_xlabel("deviation from the hover gains (%)", fontsize=8)
-        ax.legend(title="time beyond " + " / ".join(f"{100 * t:.0f}" for t in THRESHOLDS) + "%",
-                  fontsize=8, title_fontsize=8)
+        threshold_legend(ax)
     axes[0, 0].set_ylabel("flight time beyond it (%)", fontsize=8)
-    fig.suptitle(f"{title}: how far the scheduled gains stray from the same gains frozen at "
-                 f"hover, ‖K(ω) − K(hover)‖ / ‖K(hover)‖ over the four motors", fontsize=11)
+    fig.suptitle(what, fontsize=11)
     fig.tight_layout()
-    path = os.path.join(out_dir, "deviation.png")
     fig.savefig(path, dpi=110)
     plt.close(fig)
     return path
@@ -156,20 +206,35 @@ def main():
     blob = pg.read_wfg(args.gains)
     labels, rps, dt = flight_speeds(args.logs, args.motor_poles)
     dev, clamped = deviations(blob, rps)
+    ff_dev = ff_deviations(blob, clamped)
     off_grid = beyond(np.any(clamped != rps, axis=1).astype(float), dt, 0.5)
     os.makedirs(args.out_dir, exist_ok=True)
     title = f"{', '.join(labels)} on {os.path.basename(args.gains)}"
-    for path in (plot_occupancy(blob, rps, dt, args.out_dir, title),
-                 plot_deviation(dev, dt, args.out_dir, title)):
+    feedback = [name for name, _ in pg.GAINS]
+    feedforward = [name for name, _ in pg.FF_GAINS]
+    for path in (
+            plot_occupancy(blob, rps, dt, args.out_dir, title),
+            plot_deviation(dev, feedback, dt, os.path.join(args.out_dir, "deviation.png"),
+                           f"{title}: how far the scheduled feedback gains stray from the same "
+                           f"gains frozen at hover, ‖K(ω) − K(hover)‖ / ‖K(hover)‖ over the four motors"),
+            plot_deviation(ff_dev, feedforward, dt, os.path.join(args.out_dir, "deviation_ff.png"),
+                           f"{title}: how far the feedforward's gains stray from the same inverse "
+                           f"frozen at hover (horizon {blob['ff_horizon']} ticks)\nrate feedforward "
+                           f"G_h⁺ (Betaflight's feedforward), acceleration feedforward G_h⁺·F_h,ω "
+                           f"(Betaflight's feedforward boost)"),
+            plot_affine(blob, clamped, dt, os.path.join(args.out_dir, "deviation_affine.png"),
+                        f"{title}: how far the affine linearizer's voltage u_aff = G·ω|ω|\n"
+                        f"strays from hover's (no Betaflight counterpart)")):
         print(f"wrote {path}", file=sys.stderr)
     print(f"{dt.sum():.1f} s airborne, {100 * off_grid:.1f}% of it off the grid", file=sys.stderr)
     print("flight time the scheduled gains stray from hover's by more than "
           + ", ".join(f"{100 * t:.0f}%" for t in THRESHOLDS) + ":", file=sys.stderr)
-    for row, (name, _) in enumerate(pg.GAINS):
-        for col, axis in enumerate(pg.AXES):
-            print(f"  {name} on {axis:5}: "
-                  + ", ".join(f"{100 * beyond(dev[:, row, col], dt, t):4.0f}%" for t in THRESHOLDS),
-                  file=sys.stderr)
+    for names, d in ((feedback, dev), (feedforward, ff_dev)):
+        for row, name in enumerate(names):
+            for col, axis in enumerate(pg.AXES):
+                print(f"  {name} on {axis:5}: "
+                      + ", ".join(f"{100 * beyond(d[:, row, col], dt, t):4.0f}%" for t in THRESHOLDS),
+                      file=sys.stderr)
 
 
 if __name__ == "__main__":

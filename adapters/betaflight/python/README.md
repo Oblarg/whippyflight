@@ -10,7 +10,7 @@ python -m whippyflight_betaflight.extract_noise LOG.bbl noise.bin --fit FIT.json
 python -m whippyflight_betaflight.plot_occupancy gains.wfg OUT_DIR LOG.bbl...    # flight time over motor-speed space (extra: plots)
 ```
 
-`plot_occupancy` shows where a flight spends its time in a blob's motor-speed space, and how often the gains scheduled there differ from the same gains frozen at hover, a fixed PID behind a mixer.
+`plot_occupancy` shows where a flight spends its time in a blob's motor-speed space, and how often the feedback and feedforward gains scheduled there differ from the same gains frozen at hover, a fixed PID behind a mixer, and how much voltage the affine linearizer contributes there.
 
 The diagnostics place each sensor's noise split, where the fit's residual turns from the airframe's to the sensor's; noise extraction high-passes there, after taking out the motion the fit explains, and the turbulence estimate stops there. Without them extraction falls back to fixed cut-offs. With the fit it also measures how the motor-speed noise grows with motor speed over the whole flight, and `--json` records it for the sim.
 
