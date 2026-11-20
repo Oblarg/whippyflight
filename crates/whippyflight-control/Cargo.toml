@@ -32,3 +32,6 @@ airframe-drag = []
 
 [dev-dependencies]
 whippyflight-control = { path = ".", features = ["std", "airframe-drag"] }
+
+[package.metadata.docs.rs]
+all-features = true

@@ -4,6 +4,8 @@ description = "Nonlinear multirotor plant and stick-flick evaluation for whippyf
 keywords = ["lqr", "multirotor", "simulation"]
 categories = ["science::robotics", "simulation"]
 readme = "README.md"
+# The tests read the repo's fixtures, which aren't packaged.
+exclude = ["tests/"]
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
