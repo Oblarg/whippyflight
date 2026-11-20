@@ -8,7 +8,7 @@ tests/eval_feedforward.rs::flick_summary.
   python3 sweep_qr.py [--out /tmp/qr_sweep.csv] [--jobs 4]
                       [--airframe NAME | --coefficients FIT.json --noise NOISE.bin]
 
-Needs gen_wfg.py's dependencies (numpy, scipy, control, frccontrol).
+Needs gen_wfg.py's dependencies (numpy, scipy, control).
 """
 
 import argparse

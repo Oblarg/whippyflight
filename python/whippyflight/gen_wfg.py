@@ -26,7 +26,6 @@ import sys
 import numpy as np
 import scipy as sc
 import control as ct
-import frccontrol as frcct
 
 from whippyflight import coefficients
 
@@ -77,10 +76,16 @@ CANONICAL_FROM_MODEL = [(2, +1.0), (1, +1.0), (0, +1.0)]
 
 # ── DARE solver ──────────────────────────────────────────────────────────
 
+def cost_matrix(elems):
+    """Bryson's rule: the diagonal cost matrix of the allowed excursions `elems`, 1/elem²
+    (0 for an infinite excursion)."""
+    return np.diag([0.0 if elem == math.inf else 1.0 / elem**2 for elem in elems])
+
+
 def solve_dare(A, B, Q_elems, R_elems):
     """Solve discrete-time LQR.  Returns gain matrix K."""
-    Q = frcct.make_cost_matrix(Q_elems)
-    R = frcct.make_cost_matrix(R_elems)
+    Q = cost_matrix(Q_elems)
+    R = cost_matrix(R_elems)
     S = sc.linalg.solve_discrete_are(a=A, b=B, q=Q, r=R)
     return np.linalg.solve(B.T @ S @ B + R, B.T @ S @ A)
 
@@ -120,8 +125,8 @@ def solve_structured_lqr(A, B, Q_elems, R_elems, iters=200, tol=1e-9):
     unit disturbances on the three rates (gusts, setpoint steps, as seen by
     the rate error).
     """
-    Q = frcct.make_cost_matrix(Q_elems)
-    R = frcct.make_cost_matrix(R_elems)
+    Q = cost_matrix(Q_elems)
+    R = cost_matrix(R_elems)
     n = A.shape[0]
     W = np.zeros((n, n))
     W[9:12, 9:12] = np.eye(3)

@@ -9,5 +9,4 @@
 numpy==2.3.2
 scipy==1.16.1
 control==0.10.2
-frccontrol==2024.23
 matplotlib==3.10.5
