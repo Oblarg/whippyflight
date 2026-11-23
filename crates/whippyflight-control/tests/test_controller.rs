@@ -60,6 +60,25 @@ fn load_identity_gains(gains: Diag) -> GainStorage {
     storage
 }
 
+/// Kp = diag(kp·(1 + the vertex's grid indices summed)), so the gains
+/// climb with every motor's speed over the grid's 100–500 rev/s.
+fn load_scheduled_gains(kp: VoltPerRps) -> GainStorage {
+    let n = 2usize;
+    let mut spec = BlobSpec::new(n as u8);
+    spec.dt = bytemuck::cast(DT);
+    let kp: f32 = bytemuck::cast(kp);
+    for (i, v) in spec.kp.iter_mut().enumerate() {
+        let point = i / 12;
+        let (motor, axis) = ((i % 12) / 3, i % 3);
+        let level: usize = (0..4u32).map(|d| point / n.pow(d) % n).sum();
+        *v = if motor == axis { kp * (1 + level) as f32 } else { 0.0 };
+    }
+    let mut storage = GainStorage::new();
+    let result = load_gains(common::static_blob(&spec.encode()), &mut storage);
+    assert_eq!(result, GainLoadResult::Ok);
+    storage
+}
+
 fn make_sensors(gyro: [RotPerSec; 3], battery_v: Volt) -> SensorData {
     SensorData {
         gyro_rps: gyro,
@@ -91,6 +110,35 @@ fn no_gains_returns_zero_output() {
     let output = ctrl.update(&sensors, &setpoint, &storage);
     assert_eq!(output.motor_duty, [0.0; 4]);
     assert_eq!(ctrl.telemetry().status, 0);
+}
+
+/// After the first tick, each interpolation starts on one tick at its
+/// speeds and is taken up on the next, so the gains fly speeds one or two
+/// ticks old; a reset interpolates in full on its first tick.
+#[test]
+fn gains_follow_speeds_over_two_ticks() {
+    let gains = load_scheduled_gains(VoltPerRps::new(1.0));
+    let mut ctrl = ControllerState::new();
+    let setpoint = make_setpoint([0.0; 3].map(RotPerSec::new), 0.5);
+    let mut sensors = make_sensors([0.0; 3].map(RotPerSec::new), BATTERY);
+    let mut kp_at = |ctrl: &mut ControllerState, speed: f32| {
+        sensors.motor_rps = [RotPerSec::new(speed); 4];
+        ctrl.update(&sensors, &setpoint, &gains);
+        ctrl.telemetry().kp_motor0[0]
+    };
+
+    let slow = kp_at(&mut ctrl, 100.0);
+    // Starts at 500 rev/s, still flying the gains at 100.
+    assert_eq!(kp_at(&mut ctrl, 500.0), slow);
+    // Finishes at 500 rev/s, whatever this tick's speed.
+    let fast = kp_at(&mut ctrl, 100.0);
+    assert!(fast > slow, "{fast:?} vs {slow:?}");
+    // Starts at 100 rev/s, still flying the gains at 500.
+    assert_eq!(kp_at(&mut ctrl, 100.0), fast);
+    assert_eq!(kp_at(&mut ctrl, 100.0), slow);
+
+    ctrl.reset();
+    assert_eq!(kp_at(&mut ctrl, 500.0), fast);
 }
 
 #[test]
@@ -252,6 +300,78 @@ fn derivative_responds_to_error_change() {
 }
 
 #[test]
+fn feedback_splits_into_its_terms() {
+    let gains = load_identity_gains(Diag {
+        kp: VoltPerRps::new(1.0),
+        ki: VoltPerRot::new(50.0),
+        kd: VoltPerRpsPerSec::new(1e-3),
+        ..Diag::ZERO
+    });
+    let mut ctrl = ControllerState::new();
+    let setpoint = make_setpoint([1.0, 0.5, -0.5].map(RotPerSec::new), 0.5);
+    for k in 0..20 {
+        let gyro = [0.01 * k as f32, 0.0, 0.0].map(RotPerSec::new);
+        ctrl.update(&make_sensors(gyro, BATTERY), &setpoint, &gains);
+    }
+    let t = ctrl.telemetry();
+    for m in 0..3 {
+        assert!(t.feedback_p_v[m].abs() > Volt::new(0.1), "P {:?}", t.feedback_p_v);
+        assert!(t.feedback_i_v[m].abs() > Volt::new(1e-4), "I {:?}", t.feedback_i_v);
+    }
+    // Only roll's error moves.
+    assert!(t.feedback_d_v[0].abs() > Volt::new(0.0), "D {:?}", t.feedback_d_v);
+    for m in 0..4 {
+        let sum = t.feedback_p_v[m] + t.feedback_i_v[m] + t.feedback_d_v[m];
+        assert!((sum - t.feedback_v[m]).abs() < Volt::new(1e-6), "motor {m}: {sum:?} vs {:?}", t.feedback_v[m]);
+        assert!(t.applied_v[m] >= Volt::new(0.0) && t.applied_v[m] <= BATTERY);
+        assert_eq!(t.filtered_rps[m], RotPerSec::new(200.0));
+    }
+}
+
+#[test]
+fn schedule_jitter_traced() {
+    let gains = load_scheduled_gains(VoltPerRps::new(1.0));
+    let mut ctrl = ControllerState::new();
+    let setpoint = make_setpoint([1.0, 0.0, 0.0].map(RotPerSec::new), 0.5);
+    let at = |rps: f32| SensorData {
+        motor_rps: [RotPerSec::new(rps); 4],
+        ..make_sensors([0.0; 3].map(RotPerSec::new), BATTERY)
+    };
+    let jitter = |ctrl: &ControllerState| ctrl.telemetry().schedule_jitter_v[0];
+
+    // Untraced, the jitter reads zero even as the speeds jump.
+    ctrl.update(&at(300.0), &setpoint, &gains);
+    ctrl.update(&at(400.0), &setpoint, &gains);
+    assert_eq!(jitter(&ctrl), Volt::new(0.0));
+
+    // Traced at steady speeds, the gains don't move.
+    ctrl.set_effort_trace(true);
+    for _ in 0..100 {
+        ctrl.update(&at(300.0), &setpoint, &gains);
+    }
+    let steady = ctrl.telemetry().feedback_v[0];
+    assert!(jitter(&ctrl).abs() < Volt::new(1e-6), "{:?}", jitter(&ctrl));
+
+    // A step in the speeds reaches the gains within three ticks (they fly
+    // speeds one or two ticks old): almost all of the feedback's change is
+    // jitter at first, and it fades as the reference schedule follows.
+    let mut rise = Volt::new(0.0);
+    for _ in 0..3 {
+        ctrl.update(&at(400.0), &setpoint, &gains);
+        rise = ctrl.telemetry().feedback_v[0] - steady;
+        if rise > Volt::new(0.5) {
+            break;
+        }
+    }
+    assert!(rise > Volt::new(0.5), "{rise:?}");
+    assert!(jitter(&ctrl) > 0.95 * rise && jitter(&ctrl) <= rise, "{:?} of {rise:?}", jitter(&ctrl));
+    for _ in 0..4000 {
+        ctrl.update(&at(400.0), &setpoint, &gains);
+    }
+    assert!(jitter(&ctrl).abs() < 1e-3 * rise, "{:?}", jitter(&ctrl));
+}
+
+#[test]
 fn feedforward_responds_to_setpoint_change() {
     let gains = load_identity_gains(Diag { gh: RpsPerVolt::new(1.0), ..Diag::ZERO });
     let mut ctrl = ControllerState::new();
@@ -347,6 +467,39 @@ fn low_battery_guard() {
             output.motor_duty[i]
         );
     }
+}
+
+#[test]
+fn battery_floor_stops_compensation() {
+    let gains = load_identity_gains(Diag { kp: VoltPerRps::new(1.0), ..Diag::ZERO });
+    let setpoint = make_setpoint([0.5, 0.0, 0.0].map(RotPerSec::new), 0.5);
+    let duty = |reading: f32, floor: f32| {
+        let mut ctrl = ControllerState::new();
+        ctrl.set_min_battery(Volt::new(floor));
+        ctrl.update(&make_sensors([0.0; 3].map(RotPerSec::new), Volt::new(reading)), &setpoint, &gains)
+            .motor_duty
+    };
+    // Above the floor the reading is compensated; below it, the floor is used.
+    assert_ne!(duty(12.0, 10.0), duty(11.0, 10.0));
+    assert_eq!(duty(9.0, 10.0), duty(10.0, 10.0));
+    // No floor compensates any reading.
+    assert_ne!(duty(9.0, 0.0), duty(10.0, 0.0));
+}
+
+#[test]
+fn battery_lpf_lags_a_sag() {
+    let gains = load_identity_gains(Diag { kp: VoltPerRps::new(1.0), ..Diag::ZERO });
+    let setpoint = make_setpoint([0.5, 0.0, 0.0].map(RotPerSec::new), 0.5);
+    let duty_after = |second: f32, cutoff: f32| {
+        let mut ctrl = ControllerState::new();
+        ctrl.set_battery_lpf(Hertz::new(cutoff));
+        let sensors = |v: f32| make_sensors([0.0; 3].map(RotPerSec::new), Volt::new(v));
+        ctrl.update(&sensors(12.0), &setpoint, &gains);
+        ctrl.update(&sensors(second), &setpoint, &gains).motor_duty[0]
+    };
+    let (sagged, held) = (duty_after(10.0, 0.0), duty_after(12.0, 0.0));
+    let filtered = duty_after(10.0, 20.0);
+    assert!((filtered - held) * (sagged - filtered) > 0.0, "{held} {filtered} {sagged}");
 }
 
 #[test]

@@ -28,6 +28,7 @@
 //! command just created.  The interval logic below handles either sign of
 //! nᵢ; if no `(s, c)` exists at all, each motor is clipped to the range.
 
+use core::cmp::Ordering;
 use core::ops::{Add, Mul};
 
 use crate::gains::MotorDrag;
@@ -90,7 +91,7 @@ pub fn balanced_direction(
         v.map(|x| (x / v_mean).into())
     } else {
         let b_mean = mean(balance);
-        if !(b_mean > 0.0) {
+        if b_mean.partial_cmp(&0.0) != Some(Ordering::Greater) {
             return [1.0; 4];
         }
         balance.map(|b| b / b_mean)

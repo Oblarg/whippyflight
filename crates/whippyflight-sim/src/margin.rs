@@ -32,17 +32,53 @@ const MARGIN_RESOLUTION: Millis = Millis::new(0.1);
 pub const TRIM_CG_SHIFT: f64 = 0.05;
 /// How long [`trim`] flies after the shift.
 pub const TRIM: Time = Time::new(3.0);
-/// The roll-rate knock [`kick_iae`] recovers from.
+/// The rate knock [`kick_iae`] recovers from.
 pub const KICK: Rate = Rate::new(0.2);
+/// [`group_delay_margin`]'s cap, in the model's loop latencies: a loop delayed
+/// on some axes only can stay stable at any delay.
+pub const MARGIN_CAP_LATENCIES: f64 = 16.0;
 
-/// Gyro path: PT1 stages (BF's pt1FilterGain) then a delay in PID ticks,
-/// fractional delays linearly interpolated between ticks.
+/// The axes a set of LQR weights acts on, FRD.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    PitchRoll,
+    Yaw,
+}
+
+impl Group {
+    pub fn axes(self) -> [bool; 3] {
+        match self {
+            Group::PitchRoll => [true, true, false],
+            Group::Yaw => [false, false, true],
+        }
+    }
+
+    /// The axis knocked and flicked: roll for pitch/roll.
+    pub fn knock_axis(self) -> usize {
+        match self {
+            Group::PitchRoll => 0,
+            Group::Yaw => 2,
+        }
+    }
+
+    /// The axis a step torque trims: pitch (a CG shift) for pitch/roll.
+    pub fn trim_axis(self) -> usize {
+        match self {
+            Group::PitchRoll => 1,
+            Group::Yaw => 2,
+        }
+    }
+}
+
+/// Gyro path: PT1 stages (BF's pt1FilterGain) then a delay in PID ticks on
+/// some axes, fractional delays linearly interpolated between ticks.
 pub struct GyroPath {
     gains: Vec<f64>,
     state: Vec<[Rate; 3]>,
     /// Filtered samples, newest last.
     history: std::collections::VecDeque<[Rate; 3]>,
     delay_ticks: f64,
+    axes: [bool; 3],
 }
 
 impl GyroPath {
@@ -51,6 +87,11 @@ impl GyroPath {
     }
 
     pub fn delayed(cutoffs: &[Freq], delay_ticks: f64, dt: Time) -> Self {
+        Self::delayed_on(cutoffs, delay_ticks, dt, [true; 3])
+    }
+
+    /// Delayed on `axes` only.
+    pub fn delayed_on(cutoffs: &[Freq], delay_ticks: f64, dt: Time, axes: [bool; 3]) -> Self {
         let gains = cutoffs
             .iter()
             .map(|&f| {
@@ -65,6 +106,7 @@ impl GyroPath {
             state: vec![[Rate::new(0.0); 3]; n],
             history,
             delay_ticks,
+            axes,
         }
     }
 
@@ -81,20 +123,27 @@ impl GyroPath {
         let (n, f) = (self.delay_ticks.floor() as usize, self.delay_ticks.fract());
         let last = self.history.len() - 1;
         let (a, b) = (self.history[last - n], self.history[last - n - 1]);
-        core::array::from_fn(|i| ((1.0 - f) * a[i] + f * b[i]).lossy_into())
+        core::array::from_fn(|i| {
+            if self.axes[i] { (1.0 - f) * a[i] + f * b[i] } else { y[i] }.lossy_into()
+        })
     }
 }
 
-/// `model`'s gyro low-pass stages as PT1 cutoffs: BF's PT2/PT3 are 2/3 PT1s
-/// at the cutoff × CUTOFF_CORRECTION_PT2/PT3 (filter.c).
+/// `model`'s gyro low-pass stages as PT1 cutoffs (see [`stage_cutoffs`]).
 pub fn pt1_cutoffs(model: &Model) -> Result<Vec<Freq>, String> {
+    stage_cutoffs(&model.gyro_lpf, "gyro")
+}
+
+/// Low-pass `stages` as PT1 cutoffs: BF's PT2/PT3 are 2/3 PT1s at the
+/// cutoff × CUTOFF_CORRECTION_PT2/PT3 (filter.c).
+pub fn stage_cutoffs(stages: &[(String, Freq)], name: &str) -> Result<Vec<Freq>, String> {
     let mut out = vec![];
-    for (kind, hz) in &model.gyro_lpf {
+    for (kind, hz) in stages {
         match kind.as_str() {
             "PT1" => out.push(*hz),
             "PT2" => out.extend([*hz * 1.553_773_974; 2]),
             "PT3" => out.extend([*hz * 1.961_459_177; 3]),
-            _ => return Err(format!("gyro LPF type {kind} is not modeled")),
+            _ => return Err(format!("{name} LPF type {kind} is not modeled")),
         }
     }
     Ok(out)
@@ -133,7 +182,7 @@ fn s_curve(x: f64) -> f64 {
 }
 
 struct Flight {
-    /// Detrended peak-to-peak roll rate over the last 0.3 s.
+    /// Detrended peak-to-peak rate on the flick axis over the last 0.3 s.
     rest_p2p: Rate,
     /// Fraction of ticks the motors saturated.
     sat_frac: f64,
@@ -143,35 +192,32 @@ struct Flight {
     volts: Vec<[Voltage; 4]>,
 }
 
-/// What disturbs a [`flight`] at SETTLE: a pitch angular acceleration
-/// (FRD) from then on, a step in roll rate, and sensor noise throughout.
+/// What disturbs a [`flight`] at SETTLE: an angular acceleration (FRD) from
+/// then on, a step in rate, and sensor noise throughout.
 struct Disturbance<'n> {
-    torque_pitch: AngAccel,
-    kick: Rate,
+    torque: [AngAccel; 3],
+    kick: [Rate; 3],
     noise: Option<&'n Noise>,
 }
 
 const CALM: Disturbance<'static> = Disturbance {
-    torque_pitch: AngAccel::new(0.0),
-    kick: Rate::new(0.0),
+    torque: [AngAccel::new(0.0); 3],
+    kick: [Rate::new(0.0); 3],
     noise: None,
 };
 
-/// Fly a roll flick to `amp` through `path`, disturbed by `disturbance`, for
-/// `after` past SETTLE.
+/// Fly a flick to `amp` on `axis` (FRD) through `path`, disturbed by
+/// `disturbance`, for `after` past SETTLE.
 fn flight(
     gains: &GainStorage,
     model: &Model,
+    axis: usize,
     amp: Rate,
     mut path: GyroPath,
     disturbance: Disturbance,
     after: Time,
 ) -> Flight {
-    let Disturbance {
-        torque_pitch,
-        kick,
-        noise,
-    } = disturbance;
+    let Disturbance { torque, kick, noise } = disturbance;
     let dt: Time = gains.header.dt.lossy_into();
     let stick = |t: Time| {
         let t = t - SETTLE;
@@ -192,13 +238,14 @@ fn flight(
         let t = k as f64 * dt;
         let now_us = crate::flick::micros(t);
         if !kicked && t >= SETTLE {
-            plant.rate[0] += kick;
+            (0..3).for_each(|a| plant.rate[a] += kick[a]);
             kicked = true;
         }
         if t >= next_pkt {
-            let zero = RotPerSec::new(0.0);
+            let mut sticks = [RotPerSec::new(0.0); 3];
+            sticks[axis] = stick(t).lossy_into();
             sp.packet(
-                [stick(t).lossy_into(), zero, zero],
+                sticks,
                 now_us,
                 (1.0 / F_RX).lossy_into(),
             );
@@ -229,12 +276,7 @@ fn flight(
         );
         sp.condition(ctrl.reachable_target());
         let volts = model.duty_volts(out.motor_duty);
-        let no_torque = AngAccel::new(0.0);
-        let torque = [
-            no_torque,
-            if t >= SETTLE { torque_pitch } else { no_torque },
-            no_torque,
-        ];
+        let torque = if t >= SETTLE { torque } else { [AngAccel::new(0.0); 3] };
         let applied = actuator.push(volts);
         for _ in 0..4 {
             plant.rk4_with_torque(&applied, dt / 4.0, torque);
@@ -247,7 +289,7 @@ fn flight(
                 sat += 1;
             }
             if t - SETTLE >= t_end - SETTLE - Time::new(0.3) {
-                rest.push((t, plant.gyro()[0].lossy_into()));
+                rest.push((t, plant.gyro()[axis].lossy_into()));
             }
         }
     }
@@ -266,24 +308,34 @@ fn flight(
 /// loop alone holds a constant rate error under a constant torque; the
 /// (leaky) integrator is what brings it back toward zero.
 pub fn trim(gains: &GainStorage, model: &Model, cutoffs: &[Freq]) -> (Angle, Rate) {
+    group_trim(gains, model, cutoffs, Group::PitchRoll)
+}
+
+/// [`trim`] on `group`'s trim axis; for yaw the step is [`TRIM_CG_SHIFT`] of
+/// the motors' summed drag torque at hover.
+pub fn group_trim(gains: &GainStorage, model: &Model, cutoffs: &[Freq], group: Group) -> (Angle, Rate) {
     let dt: Time = gains.header.dt.lossy_into();
     let w = HOVER_SCALE * model.hover_rps;
-    let torque = TRIM_CG_SHIFT * model.pitch_prop_vel_sq * 4.0 * (w * w);
+    let axis = group.trim_axis();
+    let per_rot = match group {
+        Group::PitchRoll => model.pitch_prop_vel_sq,
+        Group::Yaw => model.yaw_prop_vel_sq,
+    };
+    let mut torque = [AngAccel::new(0.0); 3];
+    torque[axis] = TRIM_CG_SHIFT * per_rot * 4.0 * (w * w);
     let f = flight(
         gains,
         model,
+        group.knock_axis(),
         Rate::new(0.0),
         GyroPath::new(cutoffs, 0, dt),
-        Disturbance {
-            torque_pitch: torque,
-            ..CALM
-        },
+        Disturbance { torque, ..CALM },
         TRIM,
     );
-    let pitch: Vec<Rate> = f.rates.iter().map(|r| r[1]).collect();
-    let angle: Angle = pitch.iter().fold(Rate::new(0.0), |acc, &r| acc + r) * dt;
+    let rate: Vec<Rate> = f.rates.iter().map(|r| r[axis]).collect();
+    let angle: Angle = rate.iter().fold(Rate::new(0.0), |acc, &r| acc + r) * dt;
     let tail = f64::from(Time::new(0.5) / dt) as usize;
-    let residual = pitch[pitch.len() - tail..]
+    let residual = rate[rate.len() - tail..]
         .iter()
         .fold(Rate::new(0.0), |acc, &r| acc + r)
         / tail as f64;
@@ -297,22 +349,46 @@ pub fn trim(gains: &GainStorage, model: &Model, cutoffs: &[Freq]) -> (Angle, Rat
 /// isn't clean without extra delay; [`MAX_MARGIN`] if it never breaks.  A
 /// time rather than ticks so loop rates compare.
 pub fn delay_margin(gains: &GainStorage, model: &Model, cutoffs: &[Freq]) -> Millis {
+    margin_on(gains, model, cutoffs, Group::PitchRoll, [true; 3], MAX_MARGIN)
+}
+
+/// [`group_delay_margin`]'s cap for `model` flown at `dt`.
+pub fn margin_cap(model: &Model, dt: Time) -> Millis {
+    let latency = model.actuator_delay + model.telemetry_delay;
+    MARGIN_CAP_LATENCIES * rescale(if latency > dt { latency } else { dt })
+}
+
+/// [`delay_margin`] with the delay on `group`'s axes only and its flicks on
+/// its knock axis, bisected over 0–[`margin_cap`].
+pub fn group_delay_margin(gains: &GainStorage, model: &Model, cutoffs: &[Freq], group: Group) -> Millis {
+    let cap = margin_cap(model, gains.header.dt.lossy_into());
+    margin_on(gains, model, cutoffs, group, group.axes(), cap)
+}
+
+fn margin_on(
+    gains: &GainStorage,
+    model: &Model,
+    cutoffs: &[Freq],
+    group: Group,
+    axes: [bool; 3],
+    cap: Millis,
+) -> Millis {
     let dt: Time = gains.header.dt.lossy_into();
     let ok = |delay: Millis| {
         let delay: Time = rescale(delay);
         AMPS.iter().all(|&a| {
-            let path = GyroPath::delayed(cutoffs, f64::from(delay / dt), dt);
-            let f = flight(gains, model, a, path, CALM, 2.0 * RISE + HOLD + REST);
+            let path = GyroPath::delayed_on(cutoffs, f64::from(delay / dt), dt, axes);
+            let f = flight(gains, model, group.knock_axis(), a, path, CALM, 2.0 * RISE + HOLD + REST);
             f.rest_p2p < Rate::new(0.005) && f.sat_frac < 0.1
         })
     };
     if !ok(Millis::new(0.0)) {
         return Millis::new(-1.0);
     }
-    if ok(MAX_MARGIN) {
-        return MAX_MARGIN;
+    if ok(cap) {
+        return cap;
     }
-    let (mut lo, mut hi) = (Millis::new(0.0), MAX_MARGIN);
+    let (mut lo, mut hi) = (Millis::new(0.0), cap);
     while hi - lo > MARGIN_RESOLUTION {
         let mid = 0.5 * (lo + hi);
         if ok(mid) { lo = mid } else { hi = mid }
@@ -324,19 +400,28 @@ pub fn delay_margin(gains: &GainStorage, model: &Model, cutoffs: &[Freq]) -> Mil
 /// and return ∫|roll rate| dt / KICK: how long the knock takes to die out,
 /// continuous where a time to 10% would jump with each undershoot lobe.
 pub fn kick_iae(gains: &GainStorage, model: &Model, cutoffs: &[Freq]) -> Millis {
+    group_kick_iae(gains, model, cutoffs, Group::PitchRoll)
+}
+
+/// [`kick_iae`] on `group`'s knock axis.
+pub fn group_kick_iae(gains: &GainStorage, model: &Model, cutoffs: &[Freq], group: Group) -> Millis {
     let dt: Time = gains.header.dt.lossy_into();
+    let axis = group.knock_axis();
+    let mut kick = [Rate::new(0.0); 3];
+    kick[axis] = KICK;
     let f = flight(
         gains,
         model,
+        axis,
         Rate::new(0.0),
         GyroPath::new(cutoffs, 0, dt),
-        Disturbance { kick: KICK, ..CALM },
+        Disturbance { kick, ..CALM },
         2.0 * RISE + HOLD + REST,
     );
     let iae: Time = f
         .rates
         .iter()
-        .fold(Rate::new(0.0), |acc, r| acc + r[0].abs())
+        .fold(Rate::new(0.0), |acc, r| acc + r[axis].abs())
         * dt
         / KICK;
     rescale(iae)
@@ -356,6 +441,7 @@ pub fn hover_roughness(
         flight(
             gains,
             model,
+            0,
             Rate::new(0.0),
             GyroPath::new(cutoffs, 0, dt),
             Disturbance { noise, ..CALM },

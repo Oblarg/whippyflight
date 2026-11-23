@@ -4,7 +4,7 @@ mod common;
 
 use whippyflight_control::gains::spec::BlobSpec;
 use whippyflight_control::gains::{GainStorage, load_gains, REF_MOTOR_SLOTS, REF_MOTOR_WIDTH};
-use whippyflight_control::interpolation::interpolate_gains;
+use whippyflight_control::interpolation::{interpolate_feedback, interpolate_gains};
 use whippyflight_control::types::*;
 
 /// Fill a table with a gradient: entry (motor, axis) at vertex
@@ -51,6 +51,21 @@ fn load_gradient_gains() -> GainStorage {
     let result = load_gains(common::static_blob(&blob), &mut storage);
     assert_eq!(result, GainLoadResult::Ok);
     storage
+}
+
+#[test]
+fn feedback_interpolation_matches_full() {
+    let storage = load_gradient_gains();
+    let speeds = [110.0, 140.0, 175.0, 199.0].map(RotPerSec::new);
+    let full = interpolate_gains(&speeds, &storage);
+    let fb = interpolate_feedback(&speeds, &storage);
+    for m in 0..4 {
+        for a in 0..3 {
+            assert_eq!(fb.kp.as_uniform().get(m, a), full.kp.as_uniform().get(m, a));
+            assert_eq!(fb.ki.as_uniform().get(m, a), full.ki.as_uniform().get(m, a));
+            assert_eq!(fb.kd.as_uniform().get(m, a), full.kd.as_uniform().get(m, a));
+        }
+    }
 }
 
 #[test]

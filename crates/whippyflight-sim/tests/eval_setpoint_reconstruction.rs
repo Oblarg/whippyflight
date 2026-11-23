@@ -36,6 +36,9 @@ const MAX_RATE: Rate = Rate::new(2.0); // at full stick
 const JITTER: Time = Time::new(50e-6);
 const DROP_P: f64 = 0.02;
 const SETTLE: Time = Time::new(2.0);
+/// Voltage roughness is the RMS of the motor voltages high-passed here, as
+/// the flick sim's (`whippyflight_sim::flick::ROUGH_HP`).
+const ROUGH_HP: Freq = Freq::new(50.0);
 
 struct Rng(u64);
 
@@ -79,7 +82,7 @@ enum Recon {
     Pt3 { cutoff: Freq },
     /// The firmware's [`SetpointEstimator`].
     /// `jerk` ≤ 0: slew limit only.
-    Estimator { lambda: f32, slew: RotPerSecSq, jerk: RotPerSecCu },
+    Estimator { slew: RotPerSecSq, jerk: RotPerSecCu },
 }
 
 impl Recon {
@@ -87,12 +90,12 @@ impl Recon {
         match *self {
             Recon::Raw => "raw staircase, r+hΔr".into(),
             Recon::Pt3 { cutoff } => format!("PT3 {:.0} Hz, r+hΔr (BF)", value!(cutoff, Hz)),
-            Recon::Estimator { lambda, slew, .. } if !slew.is_finite() => format!("α-β λ={lambda}, no slew limit"),
-            Recon::Estimator { lambda, slew, jerk } if jerk > RotPerSecCu::new(0.0) => {
-                format!("α-β λ={lambda}, slew {} rot/s², jerk {} rot/s³",
+            Recon::Estimator { slew, .. } if !slew.is_finite() => "B-spline, no slew limit".into(),
+            Recon::Estimator { slew, jerk } if jerk > RotPerSecCu::new(0.0) => {
+                format!("B-spline, slew {} rot/s², jerk {} rot/s³",
                         value!(slew, rot / s ^ 2, f32), value!(jerk, rot / s ^ 3, f32))
             }
-            Recon::Estimator { lambda, slew, .. } => format!("α-β λ={lambda}, slew {} rot/s²", value!(slew, rot / s ^ 2, f32)),
+            Recon::Estimator { slew, .. } => format!("B-spline, slew {} rot/s²", value!(slew, rot / s ^ 2, f32)),
         }
     }
 }
@@ -110,8 +113,8 @@ struct Reconstructor {
 impl Reconstructor {
     fn new(kind: Recon, axis: usize, dt: Time) -> Self {
         let mut estimator = SetpointEstimator::new();
-        if let Recon::Estimator { lambda, slew, jerk } = kind {
-            estimator.configure(lambda, slew, jerk);
+        if let Recon::Estimator { slew, jerk } = kind {
+            estimator.configure(slew, jerk);
         }
         Self { kind, axis, dt, latest: Rate::new(0.0), pt3: [Rate::new(0.0); 3], estimator }
     }
@@ -146,6 +149,7 @@ struct Metrics {
     track_rms: Rate,
     overshoot: Rate,
     volt_rough: Voltage,
+    volt_hp: Voltage,
     sat_frac: f64,
 }
 
@@ -163,6 +167,10 @@ fn fly(gains: &GainStorage, axis: usize, stick: &dyn Fn(Time) -> Rate, dur: Time
     let mut next = 0;
     let (mut se, mut n, mut rough, mut sat) = (SpeedSq::new(0.0), 0usize, VoltageSq::new(0.0), 0usize);
     let mut peak = Rate::new(f64::MIN);
+    let w = f64::from(2.0 * core::f64::consts::PI * ROUGH_HP * dt);
+    let hp_k = w / (w + 1.0);
+    let mut low: Option<[Voltage; 4]> = None;
+    let mut hp = VoltageSq::new(0.0);
     let final_value = stick(dur);
     let ticks = f64::from(t_end / dt) as usize;
     for k in 0..ticks {
@@ -195,13 +203,19 @@ fn fly(gains: &GainStorage, axis: usize, stick: &dyn Fn(Time) -> Rate, dur: Time
         if t >= SETTLE {
             let y: Rate = sensors.gyro_rps[axis].lossy_into();
             let e = y - shifted(t);
-            se = se + e * e;
+            se += e * e;
             peak = peak.max(y);
             let step = (0..4).fold(VoltageSq::new(0.0), |acc, i| {
                 let dv = new_volts[i] - volts[i];
                 acc + dv * dv
             });
-            rough = rough + step / 4.0;
+            rough += step / 4.0;
+            let lp = low.get_or_insert(new_volts);
+            for m in 0..4 {
+                lp[m] += hp_k * (new_volts[m] - lp[m]);
+                let h = new_volts[m] - lp[m];
+                hp += h * h / 4.0;
+            }
             if ctrl.telemetry().command_scale < 0.999 {
                 sat += 1;
             }
@@ -216,6 +230,7 @@ fn fly(gains: &GainStorage, axis: usize, stick: &dyn Fn(Time) -> Rate, dur: Time
         track_rms: (se / n as f64).sqrt(),
         overshoot: peak - final_value,
         volt_rough: (rough / n as f64).sqrt(),
+        volt_hp: (hp / n as f64).sqrt(),
         sat_frac: sat as f64 / n as f64,
     }
 }
@@ -239,11 +254,11 @@ fn compare_setpoint_reconstructions() {
     let candidates = [
         Recon::Raw,
         Recon::Pt3 { cutoff: 0.375 * F_RX },
-        Recon::Estimator { lambda: 8.0, slew: RotPerSecSq::new(f32::INFINITY), jerk: no_jerk },
-        Recon::Estimator { lambda: 8.0, slew: RotPerSecSq::new(100.0), jerk: no_jerk },
-        Recon::Estimator { lambda: 8.0, slew: RotPerSecSq::new(50.0), jerk: no_jerk },
-        Recon::Estimator { lambda: 8.0, slew: RotPerSecSq::new(35.0), jerk: no_jerk },
-        Recon::Estimator { lambda: 8.0, slew, jerk },
+        Recon::Estimator { slew: RotPerSecSq::new(f32::INFINITY), jerk: no_jerk },
+        Recon::Estimator { slew: RotPerSecSq::new(100.0), jerk: no_jerk },
+        Recon::Estimator { slew: RotPerSecSq::new(50.0), jerk: no_jerk },
+        Recon::Estimator { slew: RotPerSecSq::new(35.0), jerk: no_jerk },
+        Recon::Estimator { slew, jerk },
     ];
     let slow = flick(Time::new(0.030));
     let medium = flick(Time::new(0.015));
@@ -255,8 +270,16 @@ fn compare_setpoint_reconstructions() {
             Rate::new(1.0) * f64::from(2.0 * core::f64::consts::PI * Freq::new(6.0) * t).sin()
         }
     };
+    // Rate expo on a steady stick: the rate accelerates into full
+    // deflection and stops there at its steepest.
+    let hard_stop = |t: Time| {
+        let x = f64::from((t - Time::new(0.05)) / Time::new(0.075)).clamp(0.0, 1.0);
+        MAX_RATE * (x * x)
+    };
     let (short, long) = (Time::new(0.3), Time::new(0.5));
-    let scenarios: [(&str, usize, &dyn Fn(Time) -> Rate, Time); 7] = [
+    type Stick<'a> = &'a dyn Fn(Time) -> Rate;
+    let scenarios: [(&str, usize, Stick, Time); 8] = [
+        ("pitch hard stop 0→2 rot/s, 75 ms", 1, &hard_stop, short),
         ("pitch flick 0→1 rot/s, 30 ms", 1, &slow, short),
         ("pitch flick 0→1 rot/s, 15 ms", 1, &medium, short),
         ("pitch snap  0→1 rot/s, 8 ms", 1, &snap, short),
@@ -267,12 +290,12 @@ fn compare_setpoint_reconstructions() {
     ];
     for (label, axis, stick, dur) in scenarios {
         println!("\n{label}");
-        println!("  {:30} {:>10} {:>10} {:>12} {:>8}", "reconstruction", "track_rms", "overshoot", "ΔV_rms/tick", "sat");
+        println!("  {:30} {:>10} {:>10} {:>12} {:>10} {:>8}", "reconstruction", "track_rms", "overshoot", "ΔV_rms/tick", "V_rms>50Hz", "sat");
         for kind in candidates {
             let m = fly(&gains, axis, stick, dur, kind);
-            println!("  {:30} {:10.4} {:+10.4} {:12.4} {:7.1}%",
+            println!("  {:30} {:10.4} {:+10.4} {:12.4} {:10.4} {:7.1}%",
                      kind.name(), value!(m.track_rms, rot / s), value!(m.overshoot, rot / s),
-                     value!(m.volt_rough, V), 100.0 * m.sat_frac);
+                     value!(m.volt_rough, V), value!(m.volt_hp, V), 100.0 * m.sat_frac);
         }
     }
 }

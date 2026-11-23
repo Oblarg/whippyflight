@@ -13,8 +13,7 @@ Phases:
   Phase B: Restart SITL with saved config, check the gains were copied from
            SD to RAM, send fdm+rc, verify motor output; then move the
            sticks and check the setpoint estimate and feedforward target
-           (WHIPPYFLIGHT debug mode, per loop in the motor reply) and the
-           motor response
+           (per loop in the motor reply) and the motor response
   Phase C: Remove all gains, check arming is refused (WHIPPYFLIGHT flag)
   Phase D: Missing ESC telemetry and unsupported settings (self-level
            modes, non-DROP failsafe) are reported as arming blockers
@@ -251,7 +250,7 @@ class Sim:
         self.schedule = None
         self.gyro = (0.0, 0.0, 0.0)
         self.duty = None
-        self.debug = None
+        self.setpoint = None
         self.replies = 0
         self.misses = 0
         self.trace = None
@@ -280,7 +279,7 @@ class Sim:
             return self.duty
 
     def record(self):
-        """Start recording (t, channels[:4], gyro_bf, omega, duty, debug) per
+        """Start recording (t, channels[:4], gyro_bf, omega, duty, setpoint) per
         step; open loop, gyro_bf is from set_gyro() and omega the reported
         speed."""
         with self._lock:
@@ -328,20 +327,21 @@ class Sim:
         self.motor_sock.close()
 
     def _receive(self, timeout):
-        """The motor reply (duty, debug) to the packet just sent, plus any
-        stragglers.  debug is that PID loop's debug[] (servo_packet_debug),
-        None from replies without it."""
-        duty = debug = None
+        """The motor reply (duty, setpoint) to the packet just sent, plus any
+        stragglers.  setpoint is that PID loop's WhippyFlight setpoint
+        (servo_packet_debug): raw, estimate and feedforward target per axis
+        [roll, pitch, yaw] in 0.1 deg/s; None from replies without it."""
+        duty = setpoint = None
         self.motor_sock.settimeout(timeout)
         try:
             while True:
                 data, _ = self.motor_sock.recvfrom(256)
                 duty = struct.unpack_from("<4f", data)
-                debug = struct.unpack_from("<8h", data, 16) if len(data) >= 32 else None
+                setpoint = struct.unpack_from("<9h", data, 32) if len(data) >= 50 else None
                 self.motor_sock.settimeout(0)
         except (BlockingIOError, socket.timeout, OSError):
             pass
-        return duty, debug
+        return duty, setpoint
 
     def _run(self):
         replying = False
@@ -369,15 +369,15 @@ class Sim:
             self.fdm_sock.sendto(pkt, ("127.0.0.1", 9003))
             # Wait out a PID loop while SITL is answering; while it isn't
             # (booting), keep simulated time moving at about real time.
-            duty, debug = self._receive(0.005 if replying else 0.0005)
+            duty, setpoint = self._receive(0.005 if replying else 0.0005)
             replying = duty is not None
             with self._lock:
                 if duty is not None:
-                    self.duty, self.debug = duty, debug
+                    self.duty, self.setpoint = duty, setpoint
                     self.replies += 1
                 else:
                     self.misses += 1
-                duty, debug = self.duty, self.debug
+                duty, setpoint = self.duty, self.setpoint
             if self.plant:
                 gyro_bf, omega = self.plant.gyro_bf(), tuple(self.plant.omega)
                 volts = [d * VBAT for d in duty] if duty else [0.0] * 4
@@ -389,7 +389,7 @@ class Sim:
             if self.trace is not None:
                 with self._lock:
                     if self.trace is not None:
-                        self.trace.append((self.t, ch[:4], gyro_bf, omega, duty, debug))
+                        self.trace.append((self.t, ch[:4], gyro_bf, omega, duty, setpoint))
 
 
 
@@ -658,8 +658,8 @@ def stick_input(sim, name, channel, up_pair, debug_base=None,
     during the hold the estimate must settle on the raw RX setpoint and the
     target on the estimate; the gyro stays at zero, so the held rate
     error must drive `up_pair` up, and centering must take most of it back.
-    `debug_base` is the WHIPPYFLIGHT debug channel of the axis' raw setpoint
-    (raw, estimate, target follow it); None for yaw, which is not logged.
+    `debug_base` is the index of the axis' raw setpoint in the reply's
+    setpoint record (raw, estimate, target follow it); None skips those checks.
     Everything is read from the per-loop trace at fixed simulated times."""
     print(f"\n--- {name} stick: 1500 → {peak} over {ramp_s:.1f}s, hold {hold_s:.1f}s, center ---")
     res = {}
@@ -769,8 +769,8 @@ STICK_AXES = {"Roll": (0, 0, 1.0), "Pitch": (1, 1, 1.0), "Yaw": (3, 2, -1.0)}
 FLICK_PEAK, FLICK_RISE_S, FLICK_HOLD_S, FLICK_SETTLE_S = 1750, 0.030, 0.5, 0.5
 AXIS_NAMES = ("roll", "pitch", "yaw")
 AXIS_COLORS = ("tab:blue", "tab:orange", "tab:green")
-# WHIPPYFLIGHT debug: per axis (roll, pitch) raw setpoint, estimate and
-# feedforward target in 0.1 deg/s, from channel 3·axis.
+# The reply's setpoint record: per axis raw setpoint, estimate and feedforward
+# target in 0.1 deg/s, from index 3·axis.
 DEBUG_PER_ROT_S = 3600.0
 
 

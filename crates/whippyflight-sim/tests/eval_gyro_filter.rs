@@ -184,21 +184,21 @@ fn fly_inner_with(gains: &GainStorage, amp: Rate, kick: Rate, settle: Time, mut 
         let t = k as f64 * dt;
         let now_us = common::micros64(t);
         if !kicked && t >= settle {
-            plant.rate[0] = plant.rate[0] + kick;
+            plant.rate[0] += kick;
             kicked = true;
         }
         if t >= next_pkt {
             let zero = RotPerSec::new(0.0);
             sp.packet([stick(t).lossy_into(), zero, zero], now_us, (1.0 / F_RX).lossy_into());
-            next_pkt = next_pkt + 1.0 / F_RX;
+            next_pkt += 1.0 / F_RX;
         }
         let (rate, target) = sp.tick(now_us, dt.lossy_into());
         let mut gyro = path.filter(plant.gyro());
         let mut motor_rps = plant.motor_rps();
         if let Some(noise) = noise {
             let s = noise.at(t, plant.motor_rps());
-            (0..3).for_each(|a| gyro[a] = gyro[a] + s.gyro[a]);
-            (0..4).for_each(|m| motor_rps[m] = motor_rps[m] + s.motor[m]);
+            (0..3).for_each(|a| gyro[a] += s.gyro[a]);
+            (0..4).for_each(|m| motor_rps[m] += s.motor[m]);
         }
         let sensors = SensorData { gyro_rps: gyro, motor_rps, battery_voltage: battery_v(), accel: [MetersPerSecSq::new(0.0); 3] };
         let out = ctrl.update_with_target(&sensors, &SetpointData { rate_rps: rate, throttle: throttle() },
@@ -221,10 +221,10 @@ fn fly_inner_with(gains: &GainStorage, amp: Rate, kick: Rate, settle: Time, mut 
                 let hp = volts[m] - volts_lp[m];
                 acc + hp * hp
             });
-            rough_sq = rough_sq + step / 4.0;
+            rough_sq += step / 4.0;
             trace.push(plant.rate);
             if kick > Rate::new(0.0) {
-                iae = iae + y.abs() * dt / kick;
+                iae += y.abs() * dt / kick;
                 if y.abs() > 0.1 * kick {
                     recover = rel;
                 }
@@ -241,7 +241,7 @@ fn fly_inner_with(gains: &GainStorage, amp: Rate, kick: Rate, settle: Time, mut 
             if rel >= t_end - settle - Time::new(0.3) {
                 rest.push((t, y));
                 let pitch: Rate = plant.gyro()[1].lossy_into();
-                pitch_sum = pitch_sum + pitch;
+                pitch_sum += pitch;
                 pitch_n += 1;
             }
         }

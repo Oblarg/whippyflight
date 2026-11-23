@@ -20,6 +20,7 @@
 
 pub mod allocation;
 pub mod controller;
+pub mod dropout;
 pub mod gains;
 pub mod interpolation;
 pub mod setpoint;

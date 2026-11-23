@@ -214,7 +214,6 @@ fn fly_settled(
     let mut sp = SetpointEstimator::new();
     let (slew, jerk) = target_limits(gains);
     sp.configure(
-        model.stick_tracking,
         limits.slew.map_or(slew, RotPerSecSq::new),
         limits.jerk.map_or(jerk, RotPerSecCu::new),
     );

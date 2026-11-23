@@ -7,7 +7,8 @@ A gain-scheduled LQR attitude-rate controller for quadrotors.
 | `control-law.tex` | Derivation of the attitude rate control law. |
 | `crates/whippyflight-control` | The controller: `no_std`, no allocation, no globals. |
 | `crates/whippyflight-sim` | Nonlinear plant, flick and delay-margin evaluations, sensor-noise replay. |
-| `python/whippyflight` | Gain generation (`gen_wfg`), Pareto fronts (`front_wfg`), coefficient frames, flick plots. |
+| `crates/whippyflight-design` | Gain design: structured LQR, gain blobs, Pareto fronts of the LQR weights. |
+| `python/whippyflight` | Gain generation (`gen_wfg`), coefficient frames, flick and gain plots. |
 | `adapters/betaflight` | Betaflight tools: blackbox decoding, plant fit, noise extraction, SITL harness. |
 | `fixtures` | Fitted airframes, noise recordings, the test blob, the eval baseline. |
 | `tools` | Test pipeline, LQR weight sweeps, venv requirements. |

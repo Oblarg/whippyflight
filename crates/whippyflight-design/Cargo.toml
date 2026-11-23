@@ -1,0 +1,19 @@
+[package]
+name = "whippyflight-design"
+description = "Gain design for whippyflight-control: structured LQR over a plant fit, gain blobs, and the Pareto front of the LQR weights"
+keywords = ["lqr", "multirotor", "control"]
+categories = ["science::robotics"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+whippyflight-control = { workspace = true, features = ["std"] }
+whippyflight-sim.workspace = true
+whippyunits = { workspace = true, features = ["std"] }
+whippyalgebra = { workspace = true, features = ["std"] }
+nalgebra.workspace = true
+serde_json.workspace = true

@@ -18,10 +18,15 @@ Usage:
 
 import argparse
 import binascii
+import contextlib
+import functools
+import itertools
 import json
 import math
+import os
 import struct
 import sys
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import scipy as sc
@@ -84,8 +89,10 @@ def cost_matrix(elems):
 
 def solve_dare(A, B, Q_elems, R_elems):
     """Solve discrete-time LQR.  Returns gain matrix K."""
-    Q = cost_matrix(Q_elems)
-    R = cost_matrix(R_elems)
+    return _dare_gains(A, B, cost_matrix(Q_elems), cost_matrix(R_elems))
+
+
+def _dare_gains(A, B, Q, R):
     S = sc.linalg.solve_discrete_are(a=A, b=B, q=Q, r=R)
     return np.linalg.solve(B.T @ S @ B + R, B.T @ S @ A)
 
@@ -119,7 +126,9 @@ def solve_structured_lqr(A, B, Q_elems, R_elems, iters=200, tol=1e-9):
     after the fact leaves the rest tuned for feedback that isn't there.
     This minimizes the same quadratic cost over the restricted K instead
     (Levine–Athans: the stationarity condition, iterated with a backtracking
-    step), warm-started from the truncated full solution.
+    step), warm-started from the truncated full solution, or where truncating
+    destabilizes the loop from the truncated solution of a state cost scaled
+    down until that is stable; the gains stay stabilizing throughout.
 
     Unlike the full LQR, the optimum depends on what excites the loop: here
     unit disturbances on the three rates (gusts, setpoint steps, as seen by
@@ -131,9 +140,14 @@ def solve_structured_lqr(A, B, Q_elems, R_elems, iters=200, tol=1e-9):
     W = np.zeros((n, n))
     W[9:12, 9:12] = np.eye(3)
     S = np.eye(n)[APPLIED_COLUMNS]
-    K = solve_dare(A, B, Q_elems, R_elems) @ S.T @ S
-    first = _closed_loop_cost(A, B, Q, R, K, W)
-    assert first is not None, "truncated LQR gains are unstable"
+    scale = 1.0
+    while True:
+        K = _dare_gains(A, B, scale * Q, R) @ S.T @ S
+        first = _closed_loop_cost(A, B, Q, R, K, W)
+        if first is not None:
+            break
+        scale /= 2
+        assert scale > 1e-12, "no truncated LQR gains are stable"
     J, P, L = first
     for _ in range(iters):
         F = np.linalg.solve(R + B.T @ P @ B, B.T @ P @ A @ L @ S.T) @ np.linalg.inv(S @ L @ S.T)
@@ -579,11 +593,19 @@ def build_integral_limit(coeffs, w, hover_rps, tau_int, ki_py, kp_py, min_rps, m
     return worst
 
 
+def node_gains(omegas, coeffs, w, dt, tau_int, tau_deriv, Q_elems, R_elems, structured):
+    """The LQR gains K [4, 16] at motor speeds `omegas` [FL, BL, FR, BR]."""
+    A_aug, B_aug, _ = augmented_system(omegas, coeffs, w, dt, tau_int, tau_deriv)
+    return solve_gains(A_aug, B_aug, Q_elems, R_elems, structured)
+
+
 def solve_gain_grid(coeffs, w, resolution, min_rps, max_rps, dt, tau_int, tau_deriv,
                     ff_horizon, sigma_int=0.06, sigma_deriv=20.0, sigma_rate=1.0, sigma_volt=1.0,
-                    structured=False):
+                    structured=False, hover_rps=None, jobs=None):
     """
-    Solve DARE at each point on the N⁴ motor-speed grid.
+    Solve the LQR at each point on the N⁴ motor-speed grid, or once at every
+    motor at `hover_rps` for all of them; the structured LQRs on `jobs`
+    processes (default: one per CPU).
 
     Returns numpy arrays in *Python* ordering [fl, bl, fr, br, ...]:
       ki_py  [N,N,N,N, 4, 3]   integral gains (V / rot)
@@ -602,37 +624,35 @@ def solve_gain_grid(coeffs, w, resolution, min_rps, max_rps, dt, tau_int, tau_de
     ref_py  = np.empty([N, N, N, N, REF_FLOATS])
 
     total = N ** 4
-    done = 0
-
     Q_elems, R_elems = lqr_weights(sigma_int, sigma_deriv, sigma_rate, sigma_volt)
+    nodes = list(itertools.product(range(N), repeat=4))
+    speeds = [tuple(i * rps_step + min_rps for i in node) for node in nodes]
+    solve = functools.partial(node_gains, coeffs=coeffs, w=w, dt=dt, tau_int=tau_int,
+                              tau_deriv=tau_deriv, Q_elems=Q_elems, R_elems=R_elems,
+                              structured=structured)
 
-    for fl_i in range(N):
-        for bl_i in range(N):
-            for fr_i in range(N):
-                for br_i in range(N):
-                    omega_fl = fl_i * rps_step + min_rps
-                    omega_bl = bl_i * rps_step + min_rps
-                    omega_fr = fr_i * rps_step + min_rps
-                    omega_br = br_i * rps_step + min_rps
+    workers = jobs or os.cpu_count() or 1
+    parallel = hover_rps is None and structured and workers > 1
+    with ProcessPoolExecutor(workers) if parallel else contextlib.nullcontext() as pool:
+        if hover_rps is not None:
+            gains = itertools.repeat(solve((hover_rps,) * 4))
+        elif parallel:
+            gains = pool.map(solve, speeds, chunksize=max(1, total // (4 * workers)))
+        else:
+            gains = map(solve, speeds)
 
-                    A_aug, B_aug, sys_d = augmented_system(
-                        (omega_fl, omega_bl, omega_fr, omega_br), coeffs, w, dt, tau_int, tau_deriv)
-
-                    K_full = solve_gains(A_aug, B_aug, Q_elems, R_elems, structured)
-                    # K_full is [4, 16].  Extract:
-                    #   Ki  = K[:, 0:3]   (integral gains)
-                    #   Kd  = K[:, 3:6]   (derivative gains)
-                    #   Kp  = K[:, 9:12]  (proportional / rate gains)
-                    ki_py[fl_i, bl_i, fr_i, br_i, :, :] = K_full[:, 0:3]
-                    kd_py[fl_i, bl_i, fr_i, br_i, :, :] = K_full[:, 3:6]
-                    kp_py[fl_i, bl_i, fr_i, br_i, :, :] = K_full[:, 9:12]
-
-                    binv_py[fl_i, bl_i, fr_i, br_i], ref_py[fl_i, bl_i, fr_i, br_i] = \
-                        feedforward_model(sys_d.A, sys_d.B, ff_horizon)
-
-                    done += 1
-                    if done % max(1, total // 10) == 0:
-                        print(f"  [{done}/{total}] operating points solved", file=sys.stderr)
+        for done, (node, omegas, K_full) in enumerate(zip(nodes, speeds, gains), 1):
+            # K_full is [4, 16].  Extract:
+            #   Ki  = K[:, 0:3]   (integral gains)
+            #   Kd  = K[:, 3:6]   (derivative gains)
+            #   Kp  = K[:, 9:12]  (proportional / rate gains)
+            ki_py[node] = K_full[:, 0:3]
+            kd_py[node] = K_full[:, 3:6]
+            kp_py[node] = K_full[:, 9:12]
+            sys_d = augmented_system(omegas, coeffs, w, dt, tau_int, tau_deriv)[2]
+            binv_py[node], ref_py[node] = feedforward_model(sys_d.A, sys_d.B, ff_horizon)
+            if done % max(1, total // 10) == 0:
+                print(f"  [{done}/{total}] operating points solved", file=sys.stderr)
 
     print(f"  [{total}/{total}] done", file=sys.stderr)
     return ki_py, kd_py, kp_py, binv_py, ref_py
@@ -834,6 +854,12 @@ def parse_args(argv=None):
     parser.add_argument("--structured", action="store_true",
                         help="Optimize only the gains the firmware applies (Ki, Kd, Kp) "
                              "instead of truncating the full LQR")
+    parser.add_argument("--hover-only", action="store_true",
+                        help="Solve the feedback gains once, at hover, for every grid point: "
+                             "a blob for scoring the loop at hover, not for flight")
+    parser.add_argument("--jobs", type=int, default=None,
+                        help="Processes solving the grid's structured LQRs (default: one per "
+                             "CPU)")
     parser.add_argument("--feedback-scale", type=float, default=1.0,
                         help="Scale Ki, Kd and Kp (0: feedforward only, for comparison "
                              "flights; the integral bound keeps the unscaled design's)")
@@ -848,6 +874,9 @@ def parse_args(argv=None):
         sys.exit(1)
     if not args.idle_rps >= 0:
         print("Error: idle-rps must be ≥ 0", file=sys.stderr)
+        sys.exit(1)
+    if args.jobs is not None and args.jobs < 1:
+        print("Error: jobs must be ≥ 1", file=sys.stderr)
         sys.exit(1)
     args.min_rps = max(args.min_rps, args.idle_rps)
     if args.max_rps is not None and args.max_rps <= args.min_rps:
@@ -910,7 +939,9 @@ def generate(args):
           f"grid {args.min_rps:.0f}–{args.max_rps:.0f} rev/s, dt {args.dt * 1e6:.1f} µs, "
           f"σ_volt {args.sigma_volt:.2f} V", file=sys.stderr)
 
-    print(f"Solving {'structured LQR' if args.structured else 'DARE'} on {args.resolution}⁴ = {args.resolution**4} grid points...",
+    solver = 'structured LQR' if args.structured else 'DARE'
+    print(f"Solving {solver} at hover for all {args.resolution**4} grid points..." if args.hover_only
+          else f"Solving {solver} on {args.resolution}⁴ = {args.resolution**4} grid points...",
           file=sys.stderr)
     w = arm_weights(coeffs, args.d_front, args.d_back, args.d_left, args.d_right)
     print(f"Lever-arm weights: {w}", file=sys.stderr)
@@ -919,7 +950,7 @@ def generate(args):
         coeffs, w, args.resolution, args.min_rps, args.max_rps,
         args.dt, args.tau_int, args.tau_deriv, args.ff_horizon,
         args.sigma_int, args.sigma_deriv, args.sigma_rate, args.sigma_volt,
-        args.structured)
+        args.structured, hover_rps if args.hover_only else None, args.jobs)
 
     print("Remapping to the firmware's motor order, FRD axes...", file=sys.stderr)
     if args.feedback_scale != 1.0:

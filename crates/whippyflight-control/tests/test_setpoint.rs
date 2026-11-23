@@ -1,9 +1,9 @@
-//! RX setpoint estimator (α-β tracker + slew/jerk-limited feedforward target).
+//! RX setpoint estimator (B-spline through the packets + slew/jerk-limited feedforward target).
 
 mod common;
 
 use common::micros;
-use whippyflight_control::setpoint::{kalata_gains, SetpointEstimator};
+use whippyflight_control::setpoint::SetpointEstimator;
 use whippyflight_control::types::{Micros, RotPerSec, RotPerSecCu, RotPerSecSq, Seconds};
 use whippyunits::value;
 
@@ -47,52 +47,72 @@ fn run(
     (last.0, last.1, max_step)
 }
 
+/// The spline reproduces a ramp 1.5 packet periods late.
 #[test]
-fn kalata_gains_match_closed_form() {
-    let approx = |a: f32, b: f32, tol: f32| (a - b).abs() <= tol;
-    let (alpha, beta) = kalata_gains(8.0);
-    assert!(approx(alpha, 0.9706, 1e-3), "alpha={alpha}");
-    assert!(approx(beta, 1.3726, 1e-3), "beta={beta}");
-    let (alpha, beta) = kalata_gains(0.5);
-    assert!(alpha > 0.0 && alpha < 1.0 && beta > 0.0 && beta < alpha, "{alpha} {beta}");
-}
-
-#[test]
-fn tracks_a_ramp_without_projecting_it() {
+fn tracks_a_ramp_a_period_and_a_half_behind() {
     let mut est = SetpointEstimator::new();
     // The jerk limit trails a ramp by slope²/(2J); this checks the estimate.
     let (slew, jerk) = UNLIMITED;
-    est.configure(8.0, slew, jerk);
+    est.configure(slew, jerk);
     let slope = RotPerSecSq::new(10.0);
     let (rate, target, _) = run(&mut est, |t| slope * t, 200);
     let t_last = 199.0 * PERIOD + (f32::from(PERIOD / DT) - 1.0) * DT;
-    assert!((rate[0] - slope * t_last).abs() <= RotPerSec::new(1e-3), "rate={:?}", rate[0]);
+    let expected = slope * (t_last - 1.5 * PERIOD);
+    assert!((rate[0] - expected).abs() <= RotPerSec::new(1e-4), "rate={:?} expected={expected:?}", rate[0]);
     assert!((target[0] - rate[0]).abs() <= RotPerSec::new(1e-5), "target={:?}", target[0]);
 }
 
-/// A flick that stops: the target barely passes where the stick stopped.
-/// What's left is v̂ extrapolating within the last packet; projecting the
-/// horizon ahead made the 18 deg/s, 10 ms flick's +35%.
+/// A flick that stops: neither the estimate nor the target passes where
+/// the stick stopped.
 #[test]
-fn flick_target_does_not_overshoot() {
+fn flick_does_not_overshoot() {
     let (slew, jerk) = (RotPerSecSq::new(127.0), RotPerSecCu::new(2315.0));
-    for (amp, rise, bound) in [(0.05f32, 0.010f32, 1.06f32), (0.2, 0.030, 1.015), (1.0, 0.010, 1.015)] {
+    for (amp, rise) in [(0.05f32, 0.010f32), (0.2, 0.030), (1.0, 0.010)] {
         let (amp, rise) = (RotPerSec::new(amp), Seconds::new(rise));
         let mut est = SetpointEstimator::new();
-        est.configure(8.0, slew, jerk);
+        est.configure(slew, jerk);
         let s_curve = |t: Seconds| {
             amp * 0.5 * (1.0 - (core::f32::consts::PI * f32::from(t / rise).clamp(0.0, 1.0)).cos())
         };
-        let mut peak = ZERO;
+        let (mut peak, mut est_peak) = (ZERO, ZERO);
         for n in 0..200u32 {
             let t_packet = n as f32 * PERIOD;
             est.packet(roll(s_curve(t_packet)), micros(t_packet), PERIOD);
             for k in 0..ticks_per_packet() {
+                let (rate, target) = est.tick(micros(t_packet + k as f32 * DT), DT);
+                peak = peak.max(target[0]);
+                est_peak = est_peak.max(rate[0]);
+            }
+        }
+        assert!(est_peak <= amp * 1.00001, "{amp:?} over {rise:?}: estimate peak {}", f32::from(est_peak / amp));
+        assert!(peak <= amp * 1.00001, "{amp:?} over {rise:?}: target peak {}", f32::from(peak / amp));
+    }
+}
+
+/// A fast ramp into full stick that stops dead, every other packet a
+/// repeat (a staircase, as CRSF delivers): the target stops on full stick,
+/// with or without a brake margin.
+#[test]
+fn ramp_into_full_stick_does_not_overshoot() {
+    let period = Seconds::new(1.0 / 250.0);
+    let (rise, full) = (Seconds::new(0.06), RotPerSec::new(1000.0 / 360.0));
+    for margin in [0.0, 0.2] {
+        let mut est = SetpointEstimator::new();
+        est.configure(RotPerSecSq::new(53.0), RotPerSecCu::new(2000.0));
+        est.set_brake_margin(margin);
+        let mut peak = ZERO;
+        let ticks = f32::from(period / DT).round() as u32;
+        for n in 0..100u32 {
+            let t_packet = n as f32 * period;
+            let held = (n - n % 2) as f32 * period;
+            let s = f32::from(held / rise).clamp(0.0, 1.0);
+            est.packet(roll(full * s * s), micros(t_packet), period);
+            for k in 0..ticks {
                 let (_, target) = est.tick(micros(t_packet + k as f32 * DT), DT);
                 peak = peak.max(target[0]);
             }
         }
-        assert!(peak <= bound * amp, "{amp:?} over {rise:?}: target peak {}", f32::from(peak / amp));
+        assert!(peak <= full * 1.00001, "margin {margin}: target peak {}", f32::from(peak / full));
     }
 }
 
@@ -100,7 +120,7 @@ fn flick_target_does_not_overshoot() {
 fn target_slew_is_limited() {
     let mut est = SetpointEstimator::new();
     let (slew, jerk) = (RotPerSecSq::new(100.0), RotPerSecCu::new(0.0));
-    est.configure(8.0, slew, jerk);
+    est.configure(slew, jerk);
     run(&mut est, |_| ZERO, 10);
     let (_, target, max_step) = run(&mut est, |_| RotPerSec::new(1.0), 1);
     assert!(max_step <= slew * DT + RotPerSec::new(1e-6), "max_step={max_step:?}");
@@ -114,7 +134,7 @@ fn target_slew_is_limited() {
 fn target_jerk_is_limited_and_lands_without_overshoot() {
     let (slew, jerk) = (RotPerSecSq::new(100.0), RotPerSecCu::new(5000.0));
     let mut est = SetpointEstimator::new();
-    est.configure(8.0, slew, jerk);
+    est.configure(slew, jerk);
     run(&mut est, |_| ZERO, 10);
     let step = RotPerSec::new(1.0);
     let near = RotPerSec::new(1e-3);
@@ -143,11 +163,48 @@ fn target_jerk_is_limited_and_lands_without_overshoot() {
     assert!((prev - step).abs() < RotPerSec::new(1e-4), "settles on the step: {prev:?}");
 }
 
+/// A brake margin eases the stop at the reduced jerk, leaves at the full
+/// one, and still lands on the step.
 #[test]
-fn holds_without_extrapolating_after_link_loss() {
+fn brake_margin_eases_the_stop() {
+    let (slew, jerk) = (RotPerSecSq::new(100.0), RotPerSecCu::new(5000.0));
+    let margin = 0.3;
+    let mut est = SetpointEstimator::new();
+    est.configure(slew, jerk);
+    est.set_brake_margin(margin);
+    run(&mut est, |_| ZERO, 10);
+    let step = RotPerSec::new(1.0);
+    let near = RotPerSec::new(1e-3);
+    let (mut prev, mut prev_slope, mut rise, mut ease, mut peak) =
+        (ZERO, RotPerSecSq::new(0.0), RotPerSecSq::new(0.0), RotPerSecSq::new(0.0), ZERO);
+    for n in 10..200u32 {
+        let t_packet = n as f32 * PERIOD;
+        est.packet(roll(step), micros(t_packet), PERIOD);
+        for k in 0..ticks_per_packet() {
+            let (rate, target) = est.tick(micros(t_packet + k as f32 * DT), DT);
+            if (rate[0] - step).abs() < near {
+                peak = peak.max(target[0]);
+            }
+            let slope = (target[0] - prev) / DT;
+            if (target[0] - rate[0]).abs() > near {
+                let dslope = slope - prev_slope;
+                rise = rise.max(dslope);
+                ease = ease.max(-dslope);
+            }
+            (prev, prev_slope) = (target[0], slope);
+        }
+    }
+    assert!(rise >= jerk * DT * 0.99, "leaves at the full jerk: {rise:?}");
+    assert!(ease <= (1.0 - margin) * jerk * DT * 1.02 + RotPerSecSq::new(1e-2), "eases at {ease:?}");
+    assert!(peak <= step + RotPerSec::new(1e-4), "peak={peak:?}");
+    assert!((prev - step).abs() < RotPerSec::new(1e-4), "settles on the step: {prev:?}");
+}
+
+#[test]
+fn holds_after_link_loss() {
     let mut est = SetpointEstimator::new();
     let (slew, jerk) = UNLIMITED;
-    est.configure(8.0, slew, jerk);
+    est.configure(slew, jerk);
     let ramp = RotPerSecSq::new(10.0);
     run(&mut est, |t| ramp * t, 50);
     let last_packet = micros(49.0 * PERIOD);
@@ -156,6 +213,34 @@ fn holds_without_extrapolating_after_link_loss() {
     assert_eq!(rate_a, rate_b);
     assert_eq!(target_a, rate_a);
     assert_eq!(target_b, rate_b);
+}
+
+/// A dropped packet mid-ramp: its slot holds the last value, so the
+/// estimate neither stalls nor jumps to catch up, and never runs backwards.
+#[test]
+fn keeps_its_time_base_through_a_dropped_packet() {
+    let mut est = SetpointEstimator::new();
+    let (slew, jerk) = UNLIMITED;
+    est.configure(slew, jerk);
+    let ramp = RotPerSecSq::new(10.0);
+    let normal = ramp * DT;
+    let mut prev: Option<RotPerSec> = None;
+    let mut largest = ZERO;
+    for n in 0..60u32 {
+        let t_packet = n as f32 * PERIOD;
+        if n != 40 {
+            est.packet(roll(ramp * t_packet), micros(t_packet), PERIOD);
+        }
+        for k in 0..ticks_per_packet() {
+            let (rate, _) = est.tick(micros(t_packet + k as f32 * DT), DT);
+            if let Some(p) = prev {
+                assert!(rate[0] >= p, "runs backwards at packet {n}");
+                largest = largest.max(rate[0] - p);
+            }
+            prev = Some(rate[0]);
+        }
+    }
+    assert!(largest <= 2.0 * normal, "largest step {largest:?}, ramp step {normal:?}");
 }
 
 #[test]
@@ -167,22 +252,6 @@ fn reseeds_after_a_long_gap() {
     est.packet(roll(RotPerSec::new(-0.5)), Micros::new(200_000), PERIOD);
     let (rate, _) = est.tick(Micros::new(200_000), DT);
     assert_eq!(rate[0], RotPerSec::new(-0.5));
-}
-
-#[test]
-fn lambda_is_rescaled_with_link_period() {
-    // At 250 Hz, λ_500 = 8 must act as λ = 32: one step of size 1 should be
-    // absorbed with α(32).
-    let mut est = SetpointEstimator::new();
-    let (slew, jerk) = UNLIMITED;
-    est.configure(8.0, slew, jerk);
-    let period = Seconds::new(0.004);
-    est.packet([ZERO; 3], Micros::new(0), period);
-    est.packet([ZERO; 3], Micros::new(4_000), period);
-    est.packet(roll(RotPerSec::new(1.0)), Micros::new(8_000), period);
-    let (rate, _) = est.tick(Micros::new(8_000), DT);
-    let (alpha, _) = kalata_gains(32.0);
-    assert!((rate[0] - RotPerSec::new(alpha)).abs() <= RotPerSec::new(1e-5), "rate={:?} alpha={alpha}", rate[0]);
 }
 
 /// A slow ramp of 1 µs-quantized stick (SITL's 1500 → 1800 over 0.8 s,
@@ -200,7 +269,7 @@ fn quantized_ramp_is_followed() {
     for (slew, jerk) in [(127.0, 2315.0), (154.0, 3853.0), (100.0, 5000.0)] {
         let (slew, jerk) = (RotPerSecSq::new(slew), RotPerSecCu::new(jerk));
         let mut est = SetpointEstimator::new();
-        est.configure(8.0, slew, jerk);
+        est.configure(slew, jerk);
         let (mut sum, mut n) = (ZERO, 0);
         for k in 0..f32::from(ramp_time / DT) as u32 {
             let t = k as f32 * DT;
@@ -209,7 +278,7 @@ fn quantized_ramp_is_followed() {
             }
             let (rate, target) = est.tick(micros(t), DT);
             if t > Seconds::new(0.1) {
-                sum = sum + (target[0] - rate[0]);
+                sum += target[0] - rate[0];
                 n += 1;
             }
         }
@@ -218,36 +287,13 @@ fn quantized_ramp_is_followed() {
     }
 }
 
-/// `set_lambda` on a running estimator retunes it at the current link
-/// rate: after a stick step, a higher λ is closer to the step one packet on,
-/// the same as an estimator configured with that λ from the start.
-#[test]
-fn set_lambda_retunes_a_running_estimator() {
-    let (slew, jerk) = UNLIMITED;
-    let step = |t: Seconds| if t >= 10.0 * PERIOD { RotPerSec::new(1.0) } else { ZERO };
-    let after_step = |est: &mut SetpointEstimator| run(est, step, 11).0[0];
-
-    let mut fresh = SetpointEstimator::new();
-    fresh.configure(80.0, slew, jerk);
-    let mut retuned = SetpointEstimator::new();
-    retuned.configure(8.0, slew, jerk);
-    run(&mut retuned, |_| ZERO, 1);
-    retuned.set_lambda(80.0);
-    let mut kept = SetpointEstimator::new();
-    kept.configure(8.0, slew, jerk);
-
-    let (fresh, retuned, kept) = (after_step(&mut fresh), after_step(&mut retuned), after_step(&mut kept));
-    assert!((retuned - fresh).abs() <= RotPerSec::new(1e-5), "retuned={retuned:?} fresh={fresh:?}");
-    assert!(retuned > kept, "retuned={retuned:?} kept={kept:?}");
-}
-
 /// Conditioning pulls a rising target back to a reachable value below it,
 /// but not up to one above it; `None` changes nothing.
 #[test]
 fn condition_holds_the_target_at_the_reachable() {
     let rising = || {
         let mut est = SetpointEstimator::new();
-        est.configure(8.0, RotPerSecSq::new(100.0), RotPerSecCu::new(2000.0));
+        est.configure(RotPerSecSq::new(100.0), RotPerSecCu::new(2000.0));
         let step = |t: Seconds| if t >= PERIOD { RotPerSec::new(1.0) } else { ZERO };
         let (_, target, _) = run(&mut est, step, 10);
         (est, target[0])
@@ -268,18 +314,4 @@ fn condition_holds_the_target_at_the_reachable() {
     let (mut ahead, _) = rising();
     ahead.condition(Some(roll(at + RotPerSec::new(0.1))));
     assert_eq!(next(&mut ahead), free, "not pushed forward");
-}
-
-/// A λ of 0 (an unset setting) would freeze the estimate; it tracks with the
-/// default instead.
-#[test]
-fn zero_lambda_selects_the_default() {
-    let (slew, jerk) = UNLIMITED;
-    let step = |t: Seconds| if t >= 10.0 * PERIOD { RotPerSec::new(1.0) } else { ZERO };
-    let mut zero = SetpointEstimator::new();
-    zero.configure(8.0, slew, jerk);
-    zero.set_lambda(0.0);
-    let mut default = SetpointEstimator::new();
-    default.configure(8.0, slew, jerk);
-    assert_eq!(run(&mut zero, step, 12).0[0], run(&mut default, step, 12).0[0]);
 }

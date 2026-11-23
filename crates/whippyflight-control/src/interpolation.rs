@@ -9,8 +9,8 @@
 //! which checks at compile time that every table feeds the matrix of its unit.
 
 use crate::gains::{
-    ref_slots_from_motors, GainStorage, GainTable, ReferenceModel, TableEntry, REF_FLOATS, REF_MOTOR_SLOTS,
-    REF_MOTOR_WIDTH,
+    fixed_weight, ref_slots_from_motors, GainStorage, GainTable, ReferenceModel, TableEntry, REF_FLOATS,
+    REF_MOTOR_SLOTS, REF_MOTOR_WIDTH,
 };
 use crate::types::*;
 
@@ -40,61 +40,80 @@ impl InterpolatedGains {
     }
 }
 
+/// Slots per grid point in a feedback table: motor × axis, 4×3.
+const FEEDBACK_SLOTS: usize = 12;
+
 /// The 16 corners of the grid cell around an operating point, as flat
-/// grid-point indices and multilinear weights.
+/// grid-point indices and multilinear weights in [`fixed_weight`] units.
 struct Vertices {
     points: [usize; 16],
-    weights: [f32; 16],
+    weights: [u32; 16],
+    /// The reciprocal of the rounded weights' sum.
+    per_weight: f32,
 }
 
 impl Vertices {
     /// Bit m of the corner number picks motor m's lower (0) or upper (1)
     /// grid index; the corner's weight is the product over motors of
-    /// `1 − frac` or `frac` respectively, so the weights sum to 1.
+    /// `1 − frac` or `frac` respectively, so the weights sum to 1.  Each
+    /// motor in turn doubles the corners built so far into its lower and
+    /// upper halves.
     fn new(n: usize, lower: &[usize; 4], frac: &[f32; 4]) -> Self {
+        let strides = [n * n * n, n * n, n, 1];
         let mut points = [0usize; 16];
         let mut weights = [0.0f32; 16];
-        for corner in 0..16usize {
-            let mut idx = [0usize; 4];
-            let mut weight = 1.0f32;
-            for m in 0..4 {
-                let upper = (corner >> m) & 1 == 1;
-                idx[m] = lower[m] + upper as usize;
-                weight *= if upper { frac[m] } else { 1.0 - frac[m] };
+        points[0] = (0..4).map(|m| lower[m] * strides[m]).sum();
+        weights[0] = 1.0;
+        for m in 0..4 {
+            let half = 1 << m;
+            for corner in 0..half {
+                points[corner + half] = points[corner] + strides[m];
+                weights[corner + half] = weights[corner] * frac[m];
+                weights[corner] *= 1.0 - frac[m];
             }
-            points[corner] = ((idx[0] * n + idx[1]) * n + idx[2]) * n + idx[3];
-            weights[corner] = weight;
         }
-        Self { points, weights }
+        let weights = weights.map(fixed_weight);
+        let per_weight = 1.0 / weights.iter().sum::<u32>().max(1) as f32;
+        Self { points, weights, per_weight }
     }
 
-    /// A table's rows (`W` slots each) interpolated at the operating point.
-    fn interpolate<E: TableEntry, const W: usize>(&self, table: &GainTable<E>) -> [E; W] {
-        table.blend::<W>(&self.points, &self.weights)
+    /// A 4×3 (motor × axis) feedback table interpolated at the operating point.
+    fn interpolate<E: TableEntry>(&self, table: &GainTable<E>) -> [E; FEEDBACK_SLOTS] {
+        let codes = table.codes();
+        let mut sums = [0u32; FEEDBACK_SLOTS];
+        for (&point, &w) in self.points.iter().zip(&self.weights) {
+            let start = point * FEEDBACK_SLOTS;
+            for (sum, &q) in sums.iter_mut().zip(&codes[start..start + FEEDBACK_SLOTS]) {
+                *sum += w * q as u32;
+            }
+        }
+        table.decode(0, &sums, self.per_weight)
     }
 }
 
-/// A 4×3 (motor × axis) table's interpolated entries as a uniform matrix,
-/// ready to gauge into the gain's mixed-unit type.
+/// A 4×3 (motor × axis) table interpolated at the operating point as a
+/// uniform matrix, ready to gauge into the gain's mixed-unit type.
 macro_rules! interpolate_4x3 {
     ($vertices:expr, $table:expr) => {{
-        let entries = $vertices.interpolate::<_, 12>(&$table);
+        let entries = $vertices.interpolate(&$table);
         UniformUnitMatrix::<_, SMatrix<f32, 4, 3>>::from_fn(|i, j| entries[3 * i + j]).gauge()
     }};
 }
 
-/// Interpolate gains at the given motor speeds (shaft rev/s).
-pub fn interpolate_gains(
-    motor_rps: &[RotPerSec; 4],
-    storage: &GainStorage,
-) -> InterpolatedGains {
+/// The feedback gains alone at an operating point.
+pub struct FeedbackGains {
+    pub ki: KiMatrix,
+    pub kd: KdMatrix,
+    pub kp: KpMatrix,
+}
+
+/// Each motor's position on the grid: the cell's lower index and the
+/// fraction of the way to the upper one.  Speeds off the grid clamp to its
+/// edge, and the top grid point is the last cell at frac = 1.
+fn grid_position(motor_rps: &[RotPerSec; 4], storage: &GainStorage) -> ([usize; 4], [f32; 4]) {
     let header = &storage.header;
     let n = header.resolution as usize;
     let step = (header.max_rps - header.min_rps) / (n as f32 - 1.0);
-
-    // Each motor's position on the grid: the cell's lower index and the
-    // fraction of the way to the upper one.  Speeds off the grid clamp to
-    // its edge, and the top grid point is the last cell at frac = 1.
     let mut lower = [0usize; 4];
     let mut frac = [0.0f32; 4];
     for m in 0..4 {
@@ -103,16 +122,55 @@ pub fn interpolate_gains(
         lower[m] = (position as usize).min(n - 2);
         frac[m] = position - lower[m] as f32;
     }
+    (lower, frac)
+}
 
-    let vertices = Vertices::new(n, &lower, &frac);
+/// The first half of [`interpolate_gains`]: the operating point and Ki, Kd
+/// there.  [`Self::finish`] interpolates the rest at the same point, so the
+/// work can be spread over two ticks.
+pub struct ScheduleStart {
+    lower: [usize; 4],
+    frac: [f32; 4],
+    vertices: Vertices,
+    ki: KiMatrix,
+    kd: KdMatrix,
+}
 
-    let ref_model = ReferenceModel::from_slots(&reference_model(storage, &lower, &frac));
-    InterpolatedGains {
+impl ScheduleStart {
+    pub fn new(motor_rps: &[RotPerSec; 4], storage: &GainStorage) -> Self {
+        let (lower, frac) = grid_position(motor_rps, storage);
+        let vertices = Vertices::new(storage.header.resolution as usize, &lower, &frac);
+        let ki = interpolate_4x3!(vertices, storage.ki);
+        let kd = interpolate_4x3!(vertices, storage.kd);
+        Self { lower, frac, vertices, ki, kd }
+    }
+
+    /// Kp, the reference model and G_h⁺ at the same operating point.
+    pub fn finish(self, storage: &GainStorage) -> InterpolatedGains {
+        let ref_model = ReferenceModel::from_slots(&reference_model(storage, &self.lower, &self.frac));
+        InterpolatedGains {
+            ki: self.ki,
+            kd: self.kd,
+            kp: interpolate_4x3!(self.vertices, storage.kp),
+            binv: ref_model.horizon_inverse(),
+            ref_model,
+        }
+    }
+}
+
+/// Interpolate gains at the given motor speeds (shaft rev/s).
+pub fn interpolate_gains(motor_rps: &[RotPerSec; 4], storage: &GainStorage) -> InterpolatedGains {
+    ScheduleStart::new(motor_rps, storage).finish(storage)
+}
+
+/// [`interpolate_gains`]' feedback gains only.
+pub fn interpolate_feedback(motor_rps: &[RotPerSec; 4], storage: &GainStorage) -> FeedbackGains {
+    let (lower, frac) = grid_position(motor_rps, storage);
+    let vertices = Vertices::new(storage.header.resolution as usize, &lower, &frac);
+    FeedbackGains {
         ki: interpolate_4x3!(vertices, storage.ki),
         kd: interpolate_4x3!(vertices, storage.kd),
         kp: interpolate_4x3!(vertices, storage.kp),
-        binv: ref_model.horizon_inverse(),
-        ref_model,
     }
 }
 

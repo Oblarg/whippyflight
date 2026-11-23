@@ -6,8 +6,9 @@ causes.
 
 The loop is the fit's plant at its hover speed with the firmware's control
 law around it: the feedback gains interpolated at hover from the gain grid
-(interpolation.rs), the integral and derivative filters as controller.rs
-runs them, the affine linearizer on the motor-speed telemetry, the fit's
+(interpolation.rs), or with --hover-only solved at hover, the integral and
+derivative filters as controller.rs runs them, the affine linearizer on the
+motor-speed telemetry, the fit's
 motor-command and telemetry delays, its gyro low-pass stages (as PT1s) and
 motor-speed low-pass.  The feedforward's reference model runs on its own
 state at hover and drops out.  Saturation, the integral clamp and the
@@ -94,11 +95,14 @@ class HoverLoop:
         frac = position - lower
         speeds = [a.min_rps + (lower + i) * step for i in (0, 1)]
         self.corners = []
-        for corner in range(16):
-            upper = [(corner >> m) & 1 for m in range(4)]
-            weight = np.prod([frac if u else 1.0 - frac for u in upper])
-            if weight > 0.0:
-                self.corners.append((weight, [speeds[u] for u in upper]))
+        if a.hover_only:
+            self.corners.append((1.0, [hover] * 4))
+        else:
+            for corner in range(16):
+                upper = [(corner >> m) & 1 for m in range(4)]
+                weight = np.prod([frac if u else 1.0 - frac for u in upper])
+                if weight > 0.0:
+                    self.corners.append((weight, [speeds[u] for u in upper]))
         k_I, k_alpha = c['yaw']['propAccelSum'], c['motors']['motorAccel']
         A = g.build_A_matrix(*[hover] * 4, c, self.w)
         B = np.hstack([g.build_B_matrix(k_I, k_alpha), np.eye(7)[:, [PITCH]]])
@@ -117,6 +121,8 @@ class HoverLoop:
         x = 2 * np.pi * lpf * self.dt
         self.motor_lpf = x / (1.0 + x) if lpf > 0 else None
         latency = c.get('latency') or {}
+        # The fit's measured loop latency, s.
+        self.latency = 1e-3 * (latency.get('actuator_ms', 0.0) + latency.get('telemetry_ms', 0.0))
         ticks = lambda key: max(int(round(1e-3 * latency.get(key, 0.0) / self.dt)), 0)
         self.actuator_ticks, self.telemetry_ticks = ticks('actuator_ms'), ticks('telemetry_ms')
         perm, _ = coefficients.layout(c)

@@ -51,9 +51,12 @@ The JSON's "drag" block records the axes kept; gen_wfg packs it into the
 v7 blob, and firmware built with the airframe-drag feature compensates it.
 
 The motor model V = motorAccel·ω̇ + motorVel·ω + motorVelSq·ω|ω| is fitted by
-output error (fit_motors), which also finds the voltage-to-telemetry delay;
-the JSON's "latency" block gives ACTUATOR_TICKS of it to the motors and the
-rest to the telemetry.  --select r regresses it as main.R did.
+output error (fit_motors), which also finds the voltage-to-telemetry delay.
+The voltage-to-airframe delay is where the rate axes fit best on the motor
+model's speeds from the voltages that late, through the gyro low-pass as the
+sim models it (fit_actuator_delay).  The JSON's "latency" block gives that to
+the motors and the rest of the voltage-to-telemetry delay to the telemetry.
+--select r regresses the motors as main.R did, without latency.
 
 `validate` reports per log and axis the R² of given coefficients on that
 log's rows next to the R² of a fit to that log alone.  `crossval` is
@@ -81,6 +84,7 @@ import sys
 import numpy as np
 
 from whippyflight import coefficients
+from whippyflight.hover import DEFAULT_GYRO_LPF, PT1_STAGES
 
 from whippyflight_betaflight.bbl import read_logs
 
@@ -573,20 +577,20 @@ def airframe(flights):
         "firmware": h.get("Firmware revision", ""),
         "motor_poles": poles[0],
         "loop_hz": round(1e6 / (looptime * denom), 1) if looptime else None,
+        "rx_hz": int(h.get("rc_smoothing_rx_smoothed", 0)) or None,
         "vbatcellvoltage": cellv,
         "gyro_lpf": gyro_lpf(h),
+        "dterm_lpf": dterm_lpf(h),
         "rpm_lpf_hz": int(h.get("whippyflight_rpm_lpf_hz", RPM_LPF_HZ_DEFAULT)),
-        "stick_tracking": float(h.get("whippyflight_stick_tracking", STICK_TRACKING_DEFAULT)),
+        "brake_margin_pct": int(h.get("whippyflight_brake_margin", 0)),
         "idle_rps": int(h.get("whippyflight_idle_rps", 0)),
         "stick_rates": stick_rates(h),
     }
 
 
-# The firmware's whippyflight_rpm_lpf_hz and whippyflight_stick_tracking
-# defaults, for logs that predate them (stock BF logs lack them too): what
-# the gains will fly with.
+# The firmware's whippyflight_rpm_lpf_hz default, for logs that predate it
+# (stock BF logs lack it too): what the gains will fly with.
 RPM_LPF_HZ_DEFAULT = 50
-STICK_TRACKING_DEFAULT = 8
 
 
 RATE_KEYS = ("rc_rates", "rates", "rc_expo", "rate_limits")
@@ -609,26 +613,37 @@ LPF_TYPES = {0: "PT1", 1: "BIQUAD", 2: "PT2", 3: "PT3"}
 
 
 def gyro_lpf(h):
+    """BF's gyro low-pass stages from the log header (see `lpf_stages`)."""
+    return lpf_stages(h, "gyro")
+
+
+def dterm_lpf(h):
+    """BF's D-term low-pass stages from the log header (see `lpf_stages`)."""
+    return lpf_stages(h, "dterm")
+
+
+def lpf_stages(h, prefix):
     """
-    BF's gyro low-pass stages from the log header, in order, as
-    {type, hz[, max_hz]}.  LPF1 is dynamic (cutoff rising with throttle from
-    hz to max_hz) when its dynamic minimum is set, else static; a 0 Hz stage
-    is off.  Notches and the RPM filter are not recorded.
+    BF's `prefix` ("gyro" or "dterm") low-pass stages from the log header,
+    in order, as {type, hz[, max_hz]}.  LPF1 is dynamic (cutoff rising with
+    throttle from hz to max_hz) when its dynamic minimum is set, else
+    static; a 0 Hz stage is off.  Notches and the RPM filter are not
+    recorded.
     """
     def num(key, default="0"):
-        return [int(x) for x in h.get(key, default).split(",")]
+        return [int(x) for x in h.get(f"{prefix}_{key}", default).split(",")]
 
     stages = []
-    dyn_lo, dyn_hi = (num("gyro_lpf1_dyn_hz", "0,0") + [0, 0])[:2]
-    lpf1 = num("gyro_lpf1_static_hz")[0]
-    kind = LPF_TYPES.get(num("gyro_lpf1_type")[0], "PT1")
+    dyn_lo, dyn_hi = (num("lpf1_dyn_hz", "0,0") + [0, 0])[:2]
+    lpf1 = num("lpf1_static_hz")[0]
+    kind = LPF_TYPES.get(num("lpf1_type")[0], "PT1")
     if dyn_lo > 0:
         stages.append({"type": kind, "hz": dyn_lo, "max_hz": dyn_hi})
     elif lpf1 > 0:
         stages.append({"type": kind, "hz": lpf1})
-    lpf2 = num("gyro_lpf2_static_hz")[0]
+    lpf2 = num("lpf2_static_hz")[0]
     if lpf2 > 0:
-        stages.append({"type": LPF_TYPES.get(num("gyro_lpf2_type")[0], "PT1"), "hz": lpf2})
+        stages.append({"type": LPF_TYPES.get(num("lpf2_type")[0], "PT1"), "hz": lpf2})
     return stages
 
 
@@ -721,20 +736,9 @@ def fit_arms(flights, arms, verbose=False, drag=()):
     return arms, stats
 
 
-# The longest voltage-to-telemetry delay the motor fit tries, seconds.
+# The longest voltage-to-telemetry and voltage-to-airframe delays the fit tries, seconds.
 MOTOR_DELAY_SCAN_S = 0.010
-# Loop ticks between a motor command and the ESC acting on it (the DShot
-# frame and the ESC's PWM update).  The fit sees only the whole voltage-to-
-# telemetry delay; the split rests on the gyro path's delay (filters, notches
-# that move, the gyro's own anti-alias filter), which the log doesn't pin.
-ACTUATOR_TICKS = 1
-
-
-def loop_period(flights):
-    """The PID loop's period (s) from the log header; None without one."""
-    h = next((f.header for f in flights if f.header), {})
-    looptime = int(h.get("looptime", 0))
-    return looptime * int(h.get("pid_process_denom", 1)) * 1e-6 if looptime else None
+RATE_AXES = ("yaw", "pitch", "roll")
 
 
 def fit_motors(flights, volts_map, arms, drag=()):
@@ -768,11 +772,7 @@ def fit_motors(flights, volts_map, arms, drag=()):
     at_edge = best == max(cost)
     sol = fits[best]
     k = unpack(sol.x)
-    shift = 0.0
-    if best - 1 in cost and best + 1 in cost:
-        a, b, c = cost[best - 1], cost[best], cost[best + 1]
-        if a - 2 * b + c > 0:
-            shift = 0.5 * (a - c) / (a - 2 * b + c)
+    shift = _parabola_min(cost, best)
     rows = len(sol.fun)
     cov = sol.fun @ sol.fun / max(rows - 3, 1) * np.linalg.inv(sol.jac.T @ sol.jac)
     se = np.sqrt(np.diag(cov)) * np.array([1.0, 1.0, k[2]])
@@ -780,14 +780,78 @@ def fit_motors(flights, volts_map, arms, drag=()):
     rsq = 1.0 - cost[best] / float(((measured - measured.mean()) ** 2).sum())
     coeffs = dict(zip(MOTOR_NAMES, map(float, k)))
     stats = {"r2": round(rsq, 4), "rows": rows, "method": "output error",
-             "rel_se": {n: round(float(s / abs(v)), 5) for (n, v), s in zip(coeffs.items(), se)}}
+             "rel_se": {n: rel_se(s, v) for (n, v), s in zip(coeffs.items(), se)}}
     return coeffs, stats, (best + shift) / hz, at_edge
 
 
-def latency(total_s, loop_s):
-    """The voltage-to-telemetry delay split: ACTUATOR_TICKS loop ticks for the motors, the rest the telemetry's."""
-    actuator = min(total_s, ACTUATOR_TICKS * (loop_s or 0.0))
-    return {"actuator_ms": round(1e3 * actuator, 2), "telemetry_ms": round(1e3 * (total_s - actuator), 2),
+def _parabola_min(cost, best):
+    """Sub-sample offset of the minimum of `cost` (dict by whole sample) around `best`."""
+    if best - 1 in cost and best + 1 in cost:
+        a, b, c = cost[best - 1], cost[best], cost[best + 1]
+        if a - 2 * b + c > 0:
+            return 0.5 * (a - c) / (a - 2 * b + c)
+    return 0.0
+
+
+def gyro_filtered(x, stages, hz):
+    """`x` through the gyro low-pass `stages` as the sim models them (PT1s), at `hz` samples/s."""
+    from scipy.signal import lfilter
+    for stage in stages:
+        if stage["type"] not in PT1_STAGES:
+            sys.exit(f"gyro LPF type {stage['type']} is not modeled")
+        scale, count = PT1_STAGES[stage["type"]]
+        w = 2 * math.pi * stage["hz"] * scale / hz
+        k = w / (w + 1.0)
+        for _ in range(count):
+            x = lfilter([k], [1.0, k - 1.0], x, zi=[(1.0 - k) * x[0]])[0]
+    return x
+
+
+def fit_actuator_delay(flights, motor_coeffs, arms, volts_map, drag=()):
+    """
+    The voltage-to-airframe delay (s): the one whose motor-model speeds, from the voltages
+    that late and through the gyro's low-pass stages as the sim models them, the rate axes'
+    regressions fit best (summed 1 − R²), over whole log samples up to MOTOR_DELAY_SCAN_S.
+    Returns (delay, at scan edge).
+    """
+    h = next((f.header for f in flights if f.header), {})
+    stages = gyro_lpf(h) if h else DEFAULT_GYRO_LPF
+    hz = max(f.log_hz for f in flights)
+
+    def cost(n):
+        late = []
+        for f in flights:
+            speeds = modeled_speeds(f, motor_coeffs, volts_map, n / f.log_hz)
+            filtered = tuple(gyro_filtered(np.asarray(s), stages, f.log_hz) for s in speeds)
+            g = copy.copy(f)
+            g.motors = lambda s=filtered: s
+            late.append(g)
+        return sum(1.0 - ols(*stack(late, axis, arms, volts_map, drag)[:2])[2] for axis in RATE_AXES)
+
+    costs, n, best = {}, 0, 0
+    while n <= round(MOTOR_DELAY_SCAN_S * hz):
+        costs[n] = cost(n)
+        best = min(costs, key=costs.get)
+        if n >= best + 2:
+            break
+        n += 1
+    return (best + _parabola_min(costs, best)) / hz, best == max(costs)
+
+
+def rel_se(se, value):
+    """A coefficient's standard error relative to it; None where it couldn't be estimated."""
+    rel = float(se / abs(value))
+    return round(rel, 5) if math.isfinite(rel) else None
+
+
+def percent(rel):
+    return f"{rel * 100:.2f}%" if rel is not None else "?"
+
+
+def latency(total_s, airframe_s):
+    """The voltage-to-telemetry delay split: the voltage-to-airframe delay for the motors, the rest (if any) the
+    telemetry's."""
+    return {"actuator_ms": round(1e3 * airframe_s, 2), "telemetry_ms": round(1e3 * max(total_s - airframe_s, 0.0), 2),
             "voltage_to_telemetry_ms": round(1e3 * total_s, 2)}
 
 
@@ -801,24 +865,29 @@ def fit_coeffs(flights, arms, volts_map, verbose=False, drag=()):
     for axis in AXES:
         if axis == "motors" and output_error:
             out[axis], fit_stats[axis], total, at_edge = fit_motors(flights, volts_map, arms, drag)
-            out["latency"] = latency(total, loop_period(flights))
-            if at_edge:
-                print("warning: the voltage-to-telemetry delay is at the edge of its scan; the latency is unreliable",
+            airframe_s, airframe_edge = fit_actuator_delay(flights, out[axis], arms, volts_map, drag)
+            out["latency"] = latency(total, airframe_s)
+            if at_edge or airframe_edge:
+                print("warning: a delay is at the edge of its scan; the latency is unreliable",
                       file=sys.stderr)
+            if airframe_s > total:
+                print(f"warning: the airframe answers {1e3 * airframe_s:.2f} ms after the voltages, later "
+                      f"than the telemetry's {1e3 * total:.2f} ms; the gyro path has delay the model "
+                      "lacks, given to the motors", file=sys.stderr)
             if verbose:
                 s = fit_stats[axis]
                 print(f"{axis:7s} R²={s['r2']:.4f} n={s['rows']:7d}  " +
-                      "  ".join(f"{n}={out[axis][n]:.6g}±{s['rel_se'][n] * 100:.2f}%" for n in MOTOR_NAMES) +
+                      "  ".join(f"{n}={out[axis][n]:.6g}±{percent(s['rel_se'][n])}" for n in MOTOR_NAMES) +
                       "  (output error, speeds)")
             continue
         X, y, names = stack(flights, axis, arms, volts_map, drag)
         beta, se, rsq = ols(X, y)
         out[axis] = {n: float(b) for n, b in zip(names, beta)}
         fit_stats[axis] = {"r2": round(float(rsq), 4), "rows": int(len(y)),
-                           "rel_se": {n: round(float(s / abs(b)), 5) for n, b, s in zip(names, beta, se)}}
+                           "rel_se": {n: rel_se(s, b) for n, b, s in zip(names, beta, se)}}
         if verbose:
             print(f"{axis:7s} R²={rsq:.4f} n={len(y):7d}  " +
-                  "  ".join(f"{n}={b:.6g}±{s / abs(b) * 100:.2f}%" for n, b, s in zip(names, beta, se)))
+                  "  ".join(f"{n}={b:.6g}±{percent(rel_se(s, b))}" for n, b, s in zip(names, beta, se)))
     if verbose and "latency" in out:
         lat = out["latency"]
         print(f"latency: voltage to speed telemetry {lat['voltage_to_telemetry_ms']:.2f} ms "

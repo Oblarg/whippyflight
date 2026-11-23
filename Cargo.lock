@@ -384,6 +384,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "whippyflight-design"
+version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "serde_json",
+ "whippyalgebra",
+ "whippyflight-control",
+ "whippyflight-sim",
+ "whippyunits",
+]
+
+[[package]]
 name = "whippyflight-sim"
 version = "0.1.0"
 dependencies = [

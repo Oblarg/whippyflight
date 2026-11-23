@@ -75,7 +75,7 @@
 
 use crate::allocation::{allocate, balanced_direction};
 use crate::gains::{GainStorage, ReferenceModel, ThrustTorque};
-use crate::interpolation::interpolate_gains;
+use crate::interpolation::{interpolate_feedback, interpolate_gains, InterpolatedGains, ScheduleStart};
 use crate::types::*;
 
 use whippyalgebra::nalgebra::zeros;
@@ -93,10 +93,21 @@ pub struct ControllerState {
     prev_setpoint: PropErrorVec,
     /// Minimum linearization speed (shaft rev/s); see [`Self::set_min_rps`].
     min_rps: RotPerSec,
+    /// See [`Self::set_min_battery`].
+    min_battery: Volt,
     /// Cutoff of the low-pass on reported motor speeds; see [`Self::set_motor_lpf`].
     motor_lpf: Hertz,
     /// Low-passed motor speeds; `None` until the first sample.
     motor_rps_lp: Option<[RotPerSec; 4]>,
+    /// Cutoff of the low-pass on the battery reading; see [`Self::set_battery_lpf`].
+    battery_lpf: Hertz,
+    /// Low-passed battery reading; `None` until the first sample.
+    battery_lp: Option<Volt>,
+    /// See [`Self::set_effort_trace`].
+    effort_trace: bool,
+    /// Scheduled speeds through [`SCHEDULE_TRACE_LPF`]; `None` until the
+    /// first traced sample.
+    schedule_rps_lp: Option<[RotPerSec; 4]>,
     /// Feedforward reference-model rate state r_ref.
     ref_rate: PropErrorVec,
     /// Feedforward reference-model motor-speed deviation δω_ref.
@@ -118,6 +129,15 @@ pub struct ControllerState {
     telemetry: LqrTelemetry,
     /// See [`Self::reachable_target`].
     reachable: Option<[RotPerSec; 3]>,
+    /// The gains in use, `None` until the first tick.  Interpolation is the
+    /// costliest part of a tick, so after the first tick it is spread over
+    /// two: one starts it ([`ScheduleStart`]) at that tick's speeds, the
+    /// next finishes it there and takes the result.  The motor speeds it is
+    /// scheduled on are low-passed far below the loop rate.  Takeoff
+    /// interpolates in full.
+    schedule: Option<InterpolatedGains>,
+    /// An interpolation started last tick.
+    schedule_start: Option<ScheduleStart>,
 }
 
 impl ControllerState {
@@ -128,8 +148,13 @@ impl ControllerState {
             prev_prop_error: zeros![AttitudeAxes, Scalar as f32],
             prev_setpoint: zeros![AttitudeAxes, Scalar as f32],
             min_rps: RotPerSec::new(0.0),
+            min_battery: Volt::new(0.0),
             motor_lpf: Hertz::new(0.0),
             motor_rps_lp: None,
+            battery_lpf: Hertz::new(0.0),
+            battery_lp: None,
+            effort_trace: false,
+            schedule_rps_lp: None,
             ref_rate: zeros![AttitudeAxes, Scalar as f32],
             ref_speed: zeros![MotorSpeedAxes, Scalar as f32],
             ref_seeded: false,
@@ -140,6 +165,10 @@ impl ControllerState {
             accel_lp: None,
             telemetry: LqrTelemetry {
                 feedback_v: Default::default(),
+                feedback_p_v: Default::default(),
+                feedback_i_v: Default::default(),
+                feedback_d_v: Default::default(),
+                schedule_jitter_v: Default::default(),
                 feedforward_v: Default::default(),
                 affine_v: Default::default(),
                 error_prop: Default::default(),
@@ -147,6 +176,8 @@ impl ControllerState {
                 error_integral_rate: Default::default(),
                 error_derivative: Default::default(),
                 kp_motor0: Default::default(),
+                applied_v: Default::default(),
+                filtered_rps: Default::default(),
                 collective_v: Volt::new(0.0),
                 command_scale: 1.0,
                 setpoint_rps: Default::default(),
@@ -154,6 +185,8 @@ impl ControllerState {
                 status: 0,
             },
             reachable: None,
+            schedule: None,
+            schedule_start: None,
         }
     }
 
@@ -169,7 +202,10 @@ impl ControllerState {
         self.airborne = false;
         self.landing_s = Seconds::new(0.0);
         self.motor_rps_lp = None;
+        self.schedule_rps_lp = None;
         self.reachable = None;
+        self.schedule = None;
+        self.schedule_start = None;
         #[cfg(feature = "airframe-drag")]
         {
             self.accel_lp = None;
@@ -187,6 +223,18 @@ impl ControllerState {
         self.min_rps = min_rps;
     }
 
+    /// Set the lowest battery voltage the controller compensates for.
+    ///
+    /// Voltages are commanded in volts and converted to duty at the battery
+    /// reading, so a sagging pack is driven harder to hold them: its current
+    /// climbs as it empties, and the pilot feels no sag.  Below this the
+    /// controller takes the battery to be at it, so the motors get their
+    /// command scaled by reading / floor and the airframe weakens like an
+    /// uncompensated one.  0 compensates down to any reading.
+    pub fn set_min_battery(&mut self, floor: Volt) {
+        self.min_battery = floor.max(Volt::new(0.0));
+    }
+
     /// Set the cutoff of a one-pole low-pass on the reported motor speeds,
     /// which everything downstream reads (gain schedule, feedforward,
     /// affine linearizer, takeoff/landing); 0 turns it off.  Telemetry
@@ -197,20 +245,56 @@ impl ControllerState {
         self.motor_lpf = cutoff.max(Hertz::new(0.0));
     }
 
+    /// Set the cutoff of a one-pole low-pass on the battery reading, which
+    /// converts commanded volts to duty; 0 turns it off.  The pack sags
+    /// within a flip, so a reading that lags it overstates the volts the
+    /// motors get while they are saturated, when nothing corrects it.
+    pub fn set_battery_lpf(&mut self, cutoff: Hertz) {
+        self.battery_lpf = cutoff.max(Hertz::new(0.0));
+    }
+
+    /// Trace the feedback's schedule jitter into
+    /// [`LqrTelemetry::schedule_jitter_v`], at the cost of a second
+    /// interpolation of the feedback gains every tick.
+    pub fn set_effort_trace(&mut self, on: bool) {
+        self.effort_trace = on;
+        if !on {
+            self.schedule_rps_lp = None;
+        }
+    }
+
+    /// This tick's battery reading, through the [`Self::set_battery_lpf`] filter.
+    fn filter_battery(&mut self, raw: Volt, dt: Seconds) -> Volt {
+        if self.battery_lpf <= Hertz::new(0.0) {
+            self.battery_lp = None;
+            return raw;
+        }
+        let x: f32 = (2.0 * core::f32::consts::PI * self.battery_lpf * dt).into();
+        let k = x / (1.0 + x);
+        let lp = self.battery_lp.map_or(raw, |p| p + k * (raw - p));
+        self.battery_lp = Some(lp);
+        lp
+    }
+
     /// This tick's motor speeds, through the [`Self::set_motor_lpf`] filter.
     fn filter_motor_speeds(&mut self, raw: [RotPerSec; 4], dt: Seconds) -> [RotPerSec; 4] {
         if self.motor_lpf <= Hertz::new(0.0) {
             self.motor_rps_lp = None;
             return raw;
         }
-        let x: f32 = (2.0 * core::f32::consts::PI * self.motor_lpf * dt).into();
-        let k = x / (1.0 + x);
-        let lp = match self.motor_rps_lp {
-            Some(p) => core::array::from_fn(|m| p[m] + k * (raw[m] - p[m])),
-            None => raw,
-        };
-        self.motor_rps_lp = Some(lp);
-        lp
+        low_pass(&mut self.motor_rps_lp, raw, self.motor_lpf, dt)
+    }
+
+    /// The feedback voltage the gains' motion faster than
+    /// [`SCHEDULE_TRACE_LPF`] adds, or zero with the trace off.
+    fn schedule_jitter(&mut self, feedback: MotorVoltageVec, scheduled: [RotPerSec; 4],
+                       prop_error: PropErrorVec, gains: &GainStorage, dt: Seconds) -> MotorVoltageVec {
+        if !self.effort_trace {
+            return zeros![MotorAxes, Scalar as f32];
+        }
+        let slow = low_pass(&mut self.schedule_rps_lp, scheduled, SCHEDULE_TRACE_LPF, dt);
+        let k = interpolate_feedback(&slow, gains);
+        feedback - (k.kp * prop_error + k.ki * self.integral_error + k.kd * self.derivative_error)
     }
 
     pub fn telemetry(&self) -> &LqrTelemetry {
@@ -269,6 +353,8 @@ impl ControllerState {
         gains: &GainStorage,
     ) -> ControlOutput {
         if !gains.loaded {
+            self.schedule = None;
+            self.schedule_start = None;
             self.telemetry.status = 0;
             return ControlOutput { motor_duty: [0.0; 4] };
         }
@@ -281,7 +367,9 @@ impl ControllerState {
         let setpoint_vec: SetpointDiffVec = from_array(setpoint.rate_rps);
 
         let measured_rps = self.filter_motor_speeds(sensors.motor_rps, dt);
+        let was_airborne = self.airborne;
         self.update_flight_state(sensors, measured_rps, gains, dt);
+        let took_off = self.airborne && !was_airborne;
 
         // Seed the reference model at the current setpoint so the first tick
         // after a reset produces no feedforward transient.  On the ground it
@@ -329,7 +417,17 @@ impl ControllerState {
         let header = &gains.header;
         let floor = self.min_rps.max(header.min_rps);
         let motor_rps = measured_rps.map(|w| w.clamp(floor, header.max_rps));
-        let interp = interpolate_gains(&motor_rps, gains);
+        // The feedforward switches on at takeoff, so it starts from gains at
+        // this tick's speeds rather than the ground's.
+        let interp = match (self.schedule.take(), self.schedule_start.take()) {
+            (Some(_), _) if took_off => interpolate_gains(&motor_rps, gains),
+            (Some(_), Some(start)) => start.finish(gains),
+            (Some(current), None) => {
+                self.schedule_start = Some(ScheduleStart::new(&motor_rps, gains));
+                current
+            }
+            (None, _) => interpolate_gains(&motor_rps, gains),
+        };
 
         // --- Feedback law: u_fb = Kp·e + Ki·e_int + Kd·ė ---
         //
@@ -337,7 +435,7 @@ impl ControllerState {
         //   KpMatrix [MotorAxes × AttitudeAxes]   ×  PropErrorVec [AttitudeAxes × Scalar]    → MotorVoltageVec
         //   KiMatrix [MotorAxes × IntegralAxes]   ×  IntegralErrorVec [IntegralAxes × Scalar] → MotorVoltageVec
         //   KdMatrix [MotorAxes × DerivativeAxes] ×  DerivErrorVec [DerivativeAxes × Scalar]  → MotorVoltageVec
-        let battery_v = sensors.battery_voltage.max(MIN_BATTERY_V);
+        let battery_v = self.filter_battery(sensors.battery_voltage, dt).max(self.min_battery).max(MIN_BATTERY_V);
 
         // Bound the integral's voltage on every motor by scaling its state:
         // enough to trim a generous imbalance (see TRIM_CG_ARM_FRACTION),
@@ -354,6 +452,7 @@ impl ControllerState {
         let u_p: MotorVoltageVec = interp.kp * prop_error;
         let u_d: MotorVoltageVec = interp.kd * self.derivative_error;
         let feedback: MotorVoltageVec = u_p + u_i + u_d;
+        let jitter = self.schedule_jitter(feedback, motor_rps, prop_error, gains, dt);
 
         // --- Feedforward ---
         // r_target = r + h·Δr unless the caller predicted it.
@@ -432,6 +531,10 @@ impl ControllerState {
         let kp = interp.kp.as_uniform();
         self.telemetry = LqrTelemetry {
             feedback_v: to_array(&feedback),
+            feedback_p_v: to_array(&u_p),
+            feedback_i_v: to_array(&u_i),
+            feedback_d_v: to_array(&u_d),
+            schedule_jitter_v: to_array(&jitter),
             feedforward_v: to_array(&feedforward),
             affine_v: to_array(&affine),
             error_prop: to_array(&prop_error),
@@ -439,6 +542,8 @@ impl ControllerState {
             error_integral_rate: to_array(&self.integral_error).map(|x| x / tau_int),
             error_derivative: to_array(&self.derivative_error),
             kp_motor0: [kp.get(0, 0), kp.get(0, 1), kp.get(0, 2)],
+            applied_v: alloc.voltage,
+            filtered_rps: motor_rps,
             collective_v: alloc.collective_v,
             command_scale: alloc.command_scale,
             setpoint_rps: to_array(&setpoint_vec),
@@ -449,8 +554,15 @@ impl ControllerState {
         // --- Save state ---
         self.prev_prop_error = prop_error;
         self.prev_setpoint = setpoint_vec;
+        self.schedule = Some(interp);
 
         output
+    }
+}
+
+impl Default for ControllerState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -552,48 +664,32 @@ impl ControllerState {
         horizon: u8,
         battery_v: Volt,
     ) -> MotorVoltageVec {
-        // Free response over the horizon: F_h·δx.  The rate→rate blocks are
-        // diagonal (dimensionless decay), applied elementwise.
-        let rate = to_array(&self.ref_rate);
-        let from_speed = to_array(&(ref_model.fh_rw * self.ref_speed));
-        let free: PropErrorVec = from_array(core::array::from_fn(|i| {
-            ref_model.fh_rr[i] * rate[i] + from_speed[i]
-        }));
-
-        let mut request: SetpointDiffVec = target - free;
+        let mut request: SetpointDiffVec = target - self.free_response(ref_model);
         if let Some(d) = disturbance {
-            // Horizon response to the disturbance held constant: Σ_{j<h} ad_rr^j ⊙ d.
-            let mut decay = [1.0f32; 3];
-            let mut sum = [0.0f32; 3];
-            for _ in 0..horizon {
-                for i in 0..3 {
-                    sum[i] += decay[i];
-                    decay[i] *= ref_model.ad_rr[i];
-                }
-            }
-            let (r, d) = (to_array(&request), to_array(&d));
-            request = from_array(core::array::from_fn(|i| r[i] - sum[i] * d[i]));
+            request -= held_response(ref_model, d, horizon);
         }
         let u_ff: MotorVoltageVec = *binv * request;
         from_array(to_array(&u_ff).map(|v| v.clamp(-battery_v, battery_v)))
     }
 
+    /// The reference model's h-tick free response F_h·δx.  The rate→rate
+    /// blocks are diagonal (dimensionless decay), applied elementwise.
+    fn free_response(&self, m: &ReferenceModel) -> PropErrorVec {
+        let rate = to_array(&self.ref_rate);
+        let from_speed = to_array(&(m.fh_rw * self.ref_speed));
+        from_array(core::array::from_fn(|i| m.fh_rr[i] * rate[i] + from_speed[i]))
+    }
+
     /// The reference model's rate after `horizon` ticks of `u` and the
-    /// disturbance held: what that feedforward reaches.
+    /// disturbance held, F_h·δx + G_h·u + Σ_{j<h} ad_rr^j ⊙ d: what that
+    /// feedforward reaches.
     fn horizon_rate(&self, m: &ReferenceModel, u: MotorVoltageVec, disturbance: Option<PropErrorVec>,
                     horizon: u8) -> PropErrorVec {
-        let mut rate = self.ref_rate;
-        let mut speed = self.ref_speed;
-        let uu = to_array(&u);
-        let from_volt = to_array(&(m.bd_r * u));
-        let d = disturbance.map_or([RotPerSec::new(0.0); 3], |d| to_array(&d));
-        for _ in 0..horizon {
-            let (r, s) = (to_array(&rate), to_array(&speed));
-            let fs = to_array(&(m.ad_rw * speed));
-            rate = from_array(core::array::from_fn(|i| m.ad_rr[i] * r[i] + fs[i] + from_volt[i] + d[i]));
-            speed = from_array(core::array::from_fn(|k| m.ad_ww[k] * s[k] + m.bd_w[k] * uu[k]));
+        let rate = self.free_response(m) + m.gh * u;
+        match disturbance {
+            Some(d) => rate + held_response(m, d, horizon),
+            None => rate,
         }
-        rate
     }
 
     /// One-tick ZOH propagation of the reference model with the voltage
@@ -620,10 +716,45 @@ impl ControllerState {
     }
 }
 
+/// The reference model's rate response to the disturbance `d` held over
+/// `horizon` ticks: Σ_{j<h} ad_rr^j ⊙ d.
+fn held_response(m: &ReferenceModel, d: PropErrorVec, horizon: u8) -> PropErrorVec {
+    let mut decay = [1.0f32; 3];
+    let mut sum = [0.0f32; 3];
+    for _ in 0..horizon {
+        for i in 0..3 {
+            sum[i] += decay[i];
+            decay[i] *= m.ad_rr[i];
+        }
+    }
+    let d = to_array(&d);
+    from_array(core::array::from_fn(|i| sum[i] * d[i]))
+}
+
 /// Bound on each accelerometer axis fed to the drag model, so impacts
 /// don't charge its low-pass.
 #[cfg(feature = "airframe-drag")]
 const DRAG_ACCEL_LIMIT: MetersPerSecSq = mps2(quantity!(3.0, g_n, f32));
+
+/// Cutoff of the reference schedule for
+/// [`LqrTelemetry::schedule_jitter_v`]: a decade under the band where
+/// roughness is measured, so the jitter holds all of the schedule's motion
+/// in that band and little of a maneuver's.
+pub const SCHEDULE_TRACE_LPF: Hertz = Hertz::new(5.0);
+
+/// One step of a one-pole low-pass (BF's `pt1FilterGain`) on `state`,
+/// seeded at the first sample.
+fn low_pass(state: &mut Option<[RotPerSec; 4]>, raw: [RotPerSec; 4], cutoff: Hertz,
+            dt: Seconds) -> [RotPerSec; 4] {
+    let x: f32 = (2.0 * core::f32::consts::PI * cutoff * dt).into();
+    let k = x / (1.0 + x);
+    let lp = match *state {
+        Some(p) => core::array::from_fn(|m| p[m] + k * (raw[m] - p[m])),
+        None => raw,
+    };
+    *state = Some(lp);
+    lp
+}
 
 /// Bound on the integral state's low-passed error e_int/τ_int.
 const INTEGRAL_ERROR_RATE_LIMIT: RotPerSec = RotPerSec::new(0.25);
@@ -666,3 +797,70 @@ const LANDED_HOLD_NO_ACCEL: Seconds = Seconds::new(1.0);
 /// Below this magnitude the accelerometer is taken as absent (not fitted,
 /// or USE_ACC off: the glue leaves it zero).
 const ACCEL_PRESENT: MetersPerSecSq = mps2(quantity!(0.2, g_n, f32));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gains::REF_FLOATS;
+
+    /// A reference model whose F_h and G_h tabulate `horizon` steps of its
+    /// own one-tick blocks, as the blob's do.
+    fn consistent_model(horizon: u8) -> ReferenceModel {
+        let mut r = [0.0f32; REF_FLOATS];
+        r[0..3].copy_from_slice(&[0.999, 0.998, 0.9995]);
+        for k in 0..12 {
+            r[3 + k] = 1e-3 * (k as f32 - 5.5);
+            r[19 + k] = 0.02 * (if k % 2 == 0 { 1.0 } else { -0.7 }) * (1.0 + 0.1 * k as f32);
+        }
+        r[15..19].copy_from_slice(&[0.97, 0.96, 0.975, 0.965]);
+        r[31..35].copy_from_slice(&[1.5, 1.4, 1.6, 1.45]);
+        let one_tick = r;
+        let step = |rate: [f32; 3], speed: [f32; 4], u: [f32; 4]| {
+            let r = &one_tick;
+            let rate = core::array::from_fn(|i| {
+                r[i] * rate[i] + (0..4).map(|m| r[3 + 4 * i + m] * speed[m] + r[19 + 4 * i + m] * u[m]).sum::<f32>()
+            });
+            (rate, core::array::from_fn(|m| r[15 + m] * speed[m] + r[31 + m] * u[m]))
+        };
+        let run = |mut rate: [f32; 3], mut speed: [f32; 4], u: [f32; 4]| {
+            for _ in 0..horizon {
+                (rate, speed) = step(rate, speed, u);
+            }
+            rate
+        };
+        for i in 0..3 {
+            let mut e = [0.0; 3];
+            e[i] = 1.0;
+            r[35 + i] = run(e, [0.0; 4], [0.0; 4])[i];
+        }
+        for m in 0..4 {
+            let mut e = [0.0; 4];
+            e[m] = 1.0;
+            let (free, forced) = (run([0.0; 3], e, [0.0; 4]), run([0.0; 3], [0.0; 4], e));
+            for i in 0..3 {
+                r[38 + 4 * i + m] = free[i];
+                r[50 + 4 * i + m] = forced[i];
+            }
+        }
+        ReferenceModel::from_slots(&r)
+    }
+
+    #[test]
+    fn horizon_rate_is_the_stepped_reference_model() {
+        let horizon = 16;
+        let m = consistent_model(horizon);
+        let mut ctrl = ControllerState::new();
+        ctrl.ref_rate = from_array([0.3, -0.2, 0.5].map(RotPerSec::new));
+        ctrl.ref_speed = from_array([4.0, -3.0, 2.0, -1.0].map(RotPerSec::new));
+        let u: MotorVoltageVec = from_array([1.0, -0.5, 0.25, 2.0].map(Volt::new));
+        let d: PropErrorVec = from_array([0.01, -0.02, 0.005].map(RotPerSec::new));
+        let reached = to_array(&ctrl.horizon_rate(&m, u, Some(d), horizon));
+        for _ in 0..horizon {
+            ctrl.propagate_reference(&m, u, Some(d));
+        }
+        let stepped = to_array(&ctrl.ref_rate);
+        for i in 0..3 {
+            assert!((reached[i] - stepped[i]).abs() < RotPerSec::new(1e-4), "{reached:?} vs {stepped:?}");
+        }
+    }
+}

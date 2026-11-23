@@ -52,7 +52,7 @@ fn s_curve(x: f64) -> f64 {
 /// Body x/y specific force of the scripted run.
 fn run_accel(t: Time) -> [Accel; 2] {
     let ramp = |start: Time, len: f64| s_curve(f64::from((t - start) / Time::new(len)));
-    let ax = -1.0 * ramp(SETTLE, 0.3)
+    let ax = -ramp(SETTLE, 0.3)
         + 1.8 * ramp(Time::new(1.4), 0.15)
         - 0.8 * ramp(Time::new(2.0), 0.3);
     let weave = ramp(Time::new(0.5), 0.2) - ramp(Time::new(1.9), 0.2);
@@ -113,7 +113,7 @@ fn fly(gains: &GainStorage) -> Result {
             let g = plant.gyro();
             for axis in 0..2 {
                 let rate: Rate = g[axis].lossy_into();
-                sum_sq[axis] = sum_sq[axis] + rate * rate;
+                sum_sq[axis] += rate * rate;
                 peak[axis] = peak[axis].max(rate.abs());
             }
             n += 1;

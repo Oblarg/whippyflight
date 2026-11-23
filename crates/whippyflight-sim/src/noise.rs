@@ -18,6 +18,9 @@ use whippyunits::{quantity, value};
 
 const GYRO_LSB: RotPerSec = RotPerSec::new(1e-5);
 const ERPM_LSB: RotPerSec = RotPerSec::new(1e-3);
+/// The recording and its info, next to a fit's coefficients.
+pub const NOISE_FILE: &str = "noise.bin";
+pub const NOISE_INFO: &str = "noise.json";
 const CHANNELS: usize = 7;
 const HEADER: usize = 8;
 
@@ -100,6 +103,26 @@ impl Noise {
             }
         }
         Ok(Self { speed_law: law, ..self })
+    }
+
+    /// The recording next to a fit in `fit_dir` (`noise.bin`), its
+    /// motor-speed noise following the speed law `noise.json` measured (if
+    /// any); None without one. Also `noise.json`, if readable.
+    pub fn load_fit(fit_dir: &std::path::Path) -> Result<(Option<Self>, serde_json::Value), String> {
+        let info = std::fs::read(fit_dir.join(NOISE_INFO))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .unwrap_or_default();
+        let law = &info["motor_noise_speed"];
+        let law = law["reference_rps"]
+            .as_f64()
+            .zip(law["exponent"].as_f64())
+            .map(|(reference, exponent)| SpeedLaw { reference: quantity!(reference, rot / s), exponent });
+        let noise = match std::fs::read(fit_dir.join(NOISE_FILE)) {
+            Ok(bytes) => Some(Self::from_bytes(&bytes, quantity!(0.0, s), 1.0, 1.0)?.with_speed_law(law)?),
+            Err(_) => None,
+        };
+        Ok((noise, info))
     }
 
     pub fn speed_law(&self) -> Option<SpeedLaw> {

@@ -42,8 +42,9 @@
 //! the grid, value = lo + step·q.  Every section is a multiple of 4 bytes,
 //! so the blob stays 4-byte aligned throughout.
 //!
-//! A gain table is indexed `[((m0·N + m1)·N + m2)·N + m3] · 12 + motor · 3
-//! + axis`, m_i being motor i's grid index.  The reference model's blocks
+//! A gain table is indexed
+//! `[((m0·N + m1)·N + m2)·N + m3] · 12 + motor · 3 + axis`, m_i being motor
+//! i's grid index.  The reference model's blocks
 //! each depend on at most one motor's speed (the rate and motor-speed
 //! dynamics are diagonal and the plant is block-triangular, so column m of
 //! every rate ← speed or rate ← voltage block, and motor m's own decay and
@@ -208,7 +209,7 @@ impl ReferenceModel {
     pub fn horizon_inverse(&self) -> BInvMatrix {
         let g = self.gh.to_uniform();
         let gt = g.transpose();
-        match (g * gt.clone()).try_inverse() {
+        match (g * gt).try_inverse() {
             Some(inverse) => (gt * inverse).gauge::<MotorAxes, AttitudeAxes>(),
             None => BInvMatrix::from_nalgebra(SMatrix::zeros()),
         }
@@ -488,6 +489,9 @@ impl<E: TableEntry> GainTable<E> {
     /// decoded values is the decoded average of the codes:
     /// Σ w·(lo + step·q) = lo + step·Σ w·q.  The codes are averaged and
     /// decoded once per slot, rather than once per slot per point.
+    ///
+    /// The codes are averaged in integers, with each weight rounded to
+    /// 1/[`WEIGHT_ONE`] and the average divided by the rounded weights' sum.
     pub fn blend<const W: usize>(&self, points: &[usize], weights: &[f32]) -> [E; W] {
         self.blend_slots::<W>(W, 0, points, weights)
     }
@@ -501,16 +505,41 @@ impl<E: TableEntry> GainTable<E> {
         points: &[usize],
         weights: &[f32],
     ) -> [E; K] {
-        let mut q_avg = [0.0f32; K];
+        // Each code is below 2^16 and the rounded weights sum to under
+        // 2^15 + points/2, so no sum overflows a u32.
+        let mut q_sum = [0u32; K];
+        let mut weight_sum = 0u32;
         for (&point, &weight) in points.iter().zip(weights) {
+            let w = fixed_weight(weight);
+            weight_sum += w;
             let start = point * width + first;
-            for (avg, &q) in q_avg.iter_mut().zip(&self.q[start..start + K]) {
-                *avg += weight * q as f32;
+            for (sum, &q) in q_sum.iter_mut().zip(&self.q[start..start + K]) {
+                *sum += w * q as u32;
             }
         }
-        core::array::from_fn(|k| self.lo[first + k] + self.step[first + k] * q_avg[k])
+        self.decode(first, &q_sum, 1.0 / weight_sum.max(1) as f32)
+    }
+
+    /// The codes, row-major (`lo.len()` slots per grid point).
+    pub fn codes(&self) -> &'static [u16] {
+        self.q
+    }
+
+    /// Slots `first..first + K` decoded from code sums weighted by
+    /// [`fixed_weight`]s, with `per_weight` the reciprocal of the weights' sum.
+    pub fn decode<const K: usize>(&self, first: usize, q_sum: &[u32; K], per_weight: f32) -> [E; K] {
+        core::array::from_fn(|k| self.lo[first + k] + self.step[first + k] * (q_sum[k] as f32 * per_weight))
     }
 }
+
+/// A blend weight in `0..=1` in units of 1/[`WEIGHT_ONE`], rounded.
+pub fn fixed_weight(weight: f32) -> u32 {
+    (weight * WEIGHT_ONE as f32 + 0.5) as u32
+}
+
+/// The fixed-point unit of [`GainTable::blend`]'s weights: 2^15, as fine as
+/// the tables' 16-bit codes, and small enough that the sums fit a u32.
+pub const WEIGHT_ONE: u32 = 1 << 15;
 
 /// Parsed gain header.
 #[derive(Clone, Copy)]
@@ -631,7 +660,7 @@ impl Cursor {
     fn take<E: bytemuck::Pod>(&mut self, count: usize) -> &'static [E] {
         let bytes = &self.data[self.offset..self.offset + count * core::mem::size_of::<E>()];
         self.offset += bytes.len();
-        debug_assert!(bytes.as_ptr() as usize % core::mem::align_of::<E>() == 0);
+        debug_assert!((bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<E>()));
         // SAFETY: `bytes` is in bounds and aligned (see the struct docs), and
         // `E: Pod` accepts any bit pattern.  Not `bytemuck::cast_slice`: its
         // formatting panic path pulls unwinding symbols into the SITL link.
@@ -739,7 +768,7 @@ pub fn load_gains(data: &'static [u8], storage: &mut GainStorage) -> GainLoadRes
     if data.len() < HEADER_SIZE + 4 {
         return GainLoadResult::TooShort;
     }
-    if data.as_ptr() as usize % core::mem::align_of::<f32>() != 0 {
+    if !(data.as_ptr() as usize).is_multiple_of(core::mem::align_of::<f32>()) {
         return GainLoadResult::Misaligned;
     }
     if read_u32(data, 0x00) != GAIN_MAGIC {

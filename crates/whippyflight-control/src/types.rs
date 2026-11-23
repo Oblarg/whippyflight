@@ -212,16 +212,19 @@ where
     UniformUnitMatrix::<U, SMatrix<f32, N, 1>>::from_fn(|i, _| entries[i]).gauge()
 }
 
+/// The quantity type of a uniform matrix's entries.
+type Entry<Rows, Cols> = Quantity<DivUnit<Uniform<Rows>, Uniform<Cols>>, f32>;
+
 /// The entries of a uniform column vector.
 pub fn to_array<Rows, Cols, S, const N: usize>(
     v: &MixedUnitMatrix<Rows, Cols, Matrix<f32, Const<N>, U1, S>>,
-) -> [Quantity<DivUnit<Uniform<Rows>, Uniform<Cols>>, f32>; N]
+) -> [Entry<Rows, Cols>; N]
 where
     Rows: CollapseUniform,
     Cols: CollapseUniform,
     Uniform<Rows>: UnitDiv<Uniform<Cols>>,
     S: RawStorage<f32, Const<N>, U1>,
-    Quantity<DivUnit<Uniform<Rows>, Uniform<Cols>>, f32>: FromRaw<f32>,
+    Entry<Rows, Cols>: FromRaw<f32>,
 {
     let u = v.as_uniform();
     core::array::from_fn(|i| u.get(i, 0))
@@ -277,8 +280,19 @@ pub struct ControlOutput {
 #[derive(Clone, Copy)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub struct LqrTelemetry {
-    /// Per-motor feedback voltage.
+    /// Per-motor feedback voltage: the sum of the next three.
     pub feedback_v: [Volt; 4],
+    /// Per-motor feedback voltage of the rate error (Kp·e), the integral
+    /// state (Ki·e_int) and the derivative state (Kd·ė).
+    pub feedback_p_v: [Volt; 4],
+    pub feedback_i_v: [Volt; 4],
+    pub feedback_d_v: [Volt; 4],
+    /// Per-motor part of the feedback voltage due to the gains moving with
+    /// the motor speeds faster than [`crate::controller::SCHEDULE_TRACE_LPF`]: the feedback at
+    /// the gains interpolated at the speeds, less that at the gains
+    /// interpolated at the speeds through that low-pass.  Zero unless the
+    /// effort trace is on (`ControllerState::set_effort_trace`).
+    pub schedule_jitter_v: [Volt; 4],
     /// Per-motor feedforward voltage.
     pub feedforward_v: [Volt; 4],
     /// Per-motor affine linearizer voltage.
@@ -294,6 +308,13 @@ pub struct LqrTelemetry {
     pub error_derivative: [RotPerSecSq; 3],
     /// Interpolated Kp row of motor 0: [roll, pitch, yaw].
     pub kp_motor0: [VoltPerRps; 3],
+    /// Per-motor voltage the allocator commanded: the feedback, feedforward
+    /// and affine voltages fitted into the battery's range, with the collective.
+    pub applied_v: [Volt; 4],
+    /// Per-motor measured speed the gains and the affine linearizer were
+    /// evaluated at: the reported speed through the motor low-pass, clamped
+    /// to the idle floor and the grid.
+    pub filtered_rps: [RotPerSec; 4],
     /// Collective along the thrust-balanced direction (V, motor mean).
     pub collective_v: Volt,
     /// Attitude command scale applied by the allocator; 1 unless saturated.

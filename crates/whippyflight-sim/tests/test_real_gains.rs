@@ -67,9 +67,9 @@ fn picked(m: usize, pick: &impl Fn(MotorPosition, Spin) -> bool) -> bool {
 /// Mean of `x` over the motors `pick` takes, and over the others.
 fn split_mean(x: &[f32; 4], pick: impl Fn(MotorPosition, Spin) -> bool) -> (f32, f32) {
     let (mut a, mut b) = ((0.0, 0), (0.0, 0));
-    for m in 0..4 {
+    for (m, &xm) in x.iter().enumerate() {
         let side = if picked(m, &pick) { &mut a } else { &mut b };
-        *side = (side.0 + x[m], side.1 + 1);
+        *side = (side.0 + xm, side.1 + 1);
     }
     (a.0 / a.1 as f32, b.0 / b.1 as f32)
 }

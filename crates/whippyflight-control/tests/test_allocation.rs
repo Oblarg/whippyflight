@@ -93,7 +93,7 @@ fn infeasible_falls_back_to_clipping() {
     }
 }
 
-const DRAG: MotorDrag = MotorDrag { k_w: VoltPerRps::new(0.00666413), k_w2: VoltPerRpsSq::new(2.47091361e-06) };
+const DRAG: MotorDrag = MotorDrag { k_w: VoltPerRps::new(0.00666413), k_w2: VoltPerRpsSq::new(2.470_913_6e-6) };
 // d_front/d_back = 1/1.7, d_left/d_right = 1/1: back motors at 1/√1.7 of the front.
 const BALANCE: [f32; 4] = [1.1419, 0.8758, 1.1419, 0.8758];
 

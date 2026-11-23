@@ -4,8 +4,10 @@
 use crate::units::*;
 use whippyflight_control::controller::ControllerState;
 use whippyflight_control::gains::{MotorLayout, MotorPosition, Spin};
-use whippyflight_control::setpoint::{DEFAULT_LAMBDA_500HZ, SetpointEstimator};
+use whippyflight_control::setpoint::SetpointEstimator;
 use whippyflight_control::types::{RotPerSec, Volt};
+use whippyunits::api::rescale;
+use whippyunits::quantity;
 
 /// fit_model.py's `motor_speed`: the unit its motor speeds are in.  Older fits
 /// (without it) are in eRPM/600, which this can't convert without the pole
@@ -20,6 +22,8 @@ const DEFAULT_HOVER_RPS: Rate = Rate::new(450.0);
 const MAX_LATENCY_MS: f64 = 50.0;
 /// Its gyro low-pass stages (type, cutoff), for JSONs without `gyro_lpf`.
 const DEFAULT_GYRO_LPF: [(&str, Freq); 2] = [("PT1", Freq::new(275.0)), ("PT1", Freq::new(550.0))];
+/// Betaflight's default D-term low-pass stages, for JSONs without `dterm_lpf`.
+const DEFAULT_DTERM_LPF: [(&str, Freq); 2] = [("PT1", Freq::new(75.0)), ("PT1", Freq::new(150.0))];
 
 /// Betaflight's QUADX mixer by motor index and its default (props-in)
 /// spins, for legacy fits (without a `frame` block); `yaw_motors_reversed`
@@ -59,6 +63,8 @@ pub struct Model {
     /// The firmware's gyro low-pass stages on the logged airframe (type,
     /// cutoff); a dynamic stage is at its minimum (lowest, most lag) cutoff.
     pub gyro_lpf: Vec<(String, Freq)>,
+    /// Betaflight's D-term low-pass stages on the logged airframe, likewise.
+    pub dterm_lpf: Vec<(String, Freq)>,
     /// Cutoff of the controller's low-pass on reported motor speeds
     /// (`ControllerState::set_motor_lpf`); 0, off, without `rpm_lpf_hz`.
     pub motor_lpf: Freq,
@@ -66,9 +72,10 @@ pub struct Model {
     /// (`ControllerState::set_min_rps`); 0, the gain grid's own floor,
     /// without it.
     pub min_rps: RotPerSec,
-    /// Stick setpoint tracking index λ at 500 Hz
-    /// (`SetpointEstimator::set_lambda`), from `stick_tracking`.
-    pub stick_tracking: f32,
+    /// Share of the stick target's jerk limit held back when it eases onto
+    /// its goal (`SetpointEstimator::set_brake_margin`), from
+    /// `brake_margin_pct`; 0 without it.
+    pub brake_margin: f32,
     /// Dead time between a motor command and the motor answering it (the
     /// ESC), and between the motor's speed and its report (the telemetry),
     /// from `latency`; 0 without it.
@@ -177,21 +184,23 @@ impl Model {
         } else {
             parse_frame(&c["frame"], source)?
         };
-        let gyro_lpf = match c["airframe"]["gyro_lpf"].as_array() {
-            Some(stages) => stages
-                .iter()
-                .map(|s| {
-                    let kind = s["type"].as_str().ok_or_else(|| format!("{source}: gyro_lpf type"))?;
-                    let hz = s["hz"].as_f64().ok_or_else(|| format!("{source}: gyro_lpf hz"))?;
-                    Ok((kind.to_string(), Freq::new(hz)))
-                })
-                .collect::<Result<_, String>>()?,
-            None => DEFAULT_GYRO_LPF.iter().map(|&(k, f)| (k.to_string(), f)).collect(),
+        let lpf = |key: &str, default: &[(&str, Freq)]| -> Result<Vec<(String, Freq)>, String> {
+            match c["airframe"][key].as_array() {
+                Some(stages) => stages
+                    .iter()
+                    .map(|s| {
+                        let kind = s["type"].as_str().ok_or_else(|| format!("{source}: {key} type"))?;
+                        let hz = s["hz"].as_f64().ok_or_else(|| format!("{source}: {key} hz"))?;
+                        Ok((kind.to_string(), Freq::new(hz)))
+                    })
+                    .collect(),
+                None => Ok(default.iter().map(|&(k, f)| (k.to_string(), f)).collect()),
+            }
         };
         let latency = |key: &str| -> Result<Time, String> {
             match c["latency"][key].as_f64() {
                 None => Ok(Time::new(0.0)),
-                Some(ms) if ms.is_finite() && (0.0..=MAX_LATENCY_MS).contains(&ms) => Ok(Time::new(ms * 1e-3)),
+                Some(ms) if ms.is_finite() && (0.0..=MAX_LATENCY_MS).contains(&ms) => Ok(rescale(quantity!(ms, ms))),
                 Some(ms) => Err(format!("{source}: latency.{key} {ms} ms")),
             }
         };
@@ -213,12 +222,11 @@ impl Model {
             layout,
             battery_v: c["airframe"]["vbat_v"].as_f64().map_or(DEFAULT_BATTERY_V, Voltage::new),
             hover_rps: c["airframe"]["hover_rps"].as_f64().map_or(DEFAULT_HOVER_RPS, Rate::new),
-            gyro_lpf,
+            gyro_lpf: lpf("gyro_lpf", &DEFAULT_GYRO_LPF)?,
+            dterm_lpf: lpf("dterm_lpf", &DEFAULT_DTERM_LPF)?,
             motor_lpf: Freq::new(c["airframe"]["rpm_lpf_hz"].as_f64().unwrap_or(0.0)),
             min_rps: RotPerSec::new(c["airframe"]["idle_rps"].as_f64().unwrap_or(0.0) as f32),
-            stick_tracking: c["airframe"]["stick_tracking"]
-                .as_f64()
-                .map_or(DEFAULT_LAMBDA_500HZ, |l| l as f32),
+            brake_margin: c["airframe"]["brake_margin_pct"].as_f64().map_or(0.0, |p| 0.01 * p as f32),
             actuator_delay: latency("actuator_ms")?,
             telemetry_delay: latency("telemetry_ms")?,
             source: source.to_string(),
@@ -230,7 +238,7 @@ impl Model {
     pub fn configure(&self, ctrl: &mut ControllerState, sp: &mut SetpointEstimator) {
         ctrl.set_motor_lpf(self.motor_lpf.lossy_into());
         ctrl.set_min_rps(self.min_rps);
-        sp.set_lambda(self.stick_tracking);
+        sp.set_brake_margin(self.brake_margin);
     }
 
     /// Steady-state voltage holding a motor at `omega`.
