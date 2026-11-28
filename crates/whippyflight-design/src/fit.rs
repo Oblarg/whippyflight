@@ -1,4 +1,4 @@
-//! A plant fit (fit_model.py's coefficient JSON) and the airframe it was
+//! A plant fit (whippyflight-fit's coefficient JSON) and the airframe it was
 //! logged on.
 
 use whippyflight_sim::plant::Model;

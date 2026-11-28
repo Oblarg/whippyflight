@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/whippyflight-control", "crates/whippyflight-sim", "crates/whippyflight-design"]
+members = ["crates/whippyflight-control", "crates/whippyflight-sim", "crates/whippyflight-design", "crates/whippyflight-fit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ repository = "https://github.com/Oblarg/whippyflight"
 [workspace.dependencies]
 whippyflight-control = { path = "crates/whippyflight-control", version = "0.1.0" }
 whippyflight-sim = { path = "crates/whippyflight-sim", version = "0.1.0" }
+whippyflight-design = { path = "crates/whippyflight-design", version = "0.1.0" }
 nalgebra = { version = "0.33", default-features = false, features = ["std"] }
 # >= 0.3.4 for standard gravity (`g_n`), 0.3.5 for compile-time float rescale factors.
 whippyunits = { version = "0.3.5", default-features = false }

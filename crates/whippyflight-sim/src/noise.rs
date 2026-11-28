@@ -1,5 +1,5 @@
 //! Replay of measured sensor noise, as a firmware's noise extractor (e.g.
-//! whippyflight_betaflight.extract_noise) writes it from a flight
+//! whippyflight-fit's noise) writes it from a flight
 //! log: the firmware's filtered gyro (FRD) and the motor speed telemetry
 //! (shaft rev/s, by firmware motor index), high-passed to remove the body's
 //! own motion, looped.  The gyro noise was taken after the firmware's
@@ -55,7 +55,7 @@ pub struct NoiseSample {
 }
 
 impl Noise {
-    /// Parse extract_noise.py's output, starting `offset` into the recording
+    /// Parse a noise extractor's output, starting `offset` into the recording
     /// (it loops), with the gyro and motor-speed noise scaled separately.
     pub fn from_bytes(
         bytes: &[u8],

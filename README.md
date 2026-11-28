@@ -57,8 +57,7 @@ tools/.venv/bin/pip install -r tools/requirements.txt
 Fit a Betaflight log (the CLI dump records mixer and motor direction), then generate gains:
 
 ```sh
-tools/.venv/bin/python -m whippyflight_betaflight.fit_model fit LOG.bbl \
-    -o FIT.json --dump cli_dump.txt
+cargo run --release -p whippyflight-fit -- fit LOG.bbl -o FIT.json --dump cli_dump.txt
 tools/.venv/bin/python -m whippyflight.gen_wfg FIT.json gains.wfg \
     --dt 1.25e-4 --resolution 4 --idle-rps 180
 ```

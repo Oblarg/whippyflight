@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "whippyflight-betaflight"
-version = "0.1.0"
-description = "Betaflight tools for whippyflight: blackbox decoding, the plant fit, and sensor noise extraction"
+version = "0.2.1"
+description = "Betaflight tools for whippyflight: blackbox decoding, fit plots, motor-speed occupancy, and voltage roughness by source"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE"]

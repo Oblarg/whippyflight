@@ -9,7 +9,7 @@ use whippyflight_control::types::{RotPerSec, Volt};
 use whippyunits::api::rescale;
 use whippyunits::quantity;
 
-/// fit_model.py's `motor_speed`: the unit its motor speeds are in.  Older fits
+/// A fit's `motor_speed`: the unit its motor speeds are in.  Older fits
 /// (without it) are in eRPM/600, which this can't convert without the pole
 /// count they were logged with.
 pub const MOTOR_SPEED_UNIT: &str = "shaft rev/s";

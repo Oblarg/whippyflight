@@ -351,7 +351,7 @@ def build_thrust_torque(coeffs, w, perm):
 def build_airframe_drag(coeffs):
     """
     Airframe drag block [lp_hz, roll←accX, roll←accY, pitch←accX, pitch←accY]
-    from fit_model.py's drag terms: angular acceleration per specific force
+    from the fit's drag terms: angular acceleration per specific force
     (rot/s² per m/s², i.e. rot/m) from the low-passed body x/y accelerometer,
     FRD both (as coefficients.normalize leaves them).  All zero (mode off)
     unless the fit kept drag terms on some axis.
@@ -377,7 +377,7 @@ TARGET_JERK_FRACTION = 0.63
 
 
 def operating_point(coeffs):
-    """(cells, hover rev/s, loop Hz) from fit_model's airframe block."""
+    """(cells, hover rev/s, loop Hz) from the fit's airframe block."""
     a = coeffs['airframe']
     return a['cells'], a['hover_rps'], a['loop_hz']
 
@@ -893,7 +893,7 @@ def load_coefficients(path):
         raw = json.load(f)
     if raw.get('motor_speed') != MOTOR_SPEED_UNIT or 'airframe' not in raw:
         sys.exit(f"{path} was fitted before motor speeds were in "
-                 f"{MOTOR_SPEED_UNIT}; fit it again with fit_model.py")
+                 f"{MOTOR_SPEED_UNIT}; fit it again with whippyflight-fit")
     try:
         coeffs = coefficients.normalize(raw)
     except coefficients.FrameError as e:

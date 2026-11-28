@@ -1,6 +1,6 @@
 //! The evals' sensor noise: $NOISE_PATH, else
 //! tools/airframes/meteor65_noise.bin (the default plant's airframe), both
-//! written by whippyflight_betaflight.extract_noise from a blackbox log of the airframe the
+//! written by whippyflight-fit noise from a blackbox log of the airframe the
 //! plant models.  The gyro noise was taken after BF's filters, so it belongs on top
 //! of that airframe's logged gyro path, not the unfiltered one.
 #![allow(dead_code)]

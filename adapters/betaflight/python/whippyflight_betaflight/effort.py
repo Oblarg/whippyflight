@@ -20,9 +20,11 @@ is of the same variance, and is already counted in P, I and D.
 import argparse
 
 import numpy as np
+from scipy import signal
 
 from whippyflight_betaflight.bbl import read_logs
-from whippyflight_betaflight.extract_noise import ROUGH_HP_HZ, one_pole_hp
+
+ROUGH_HP_HZ = 50.0
 
 # build/debug.h: DEBUG_WHIPPYFLIGHT.  Logs record the mode by index.
 DEBUG_WHIPPYFLIGHT = 114
@@ -30,6 +32,13 @@ DEBUG_WHIPPYFLIGHT = 114
 TERMS = ("P", "I", "D", "feedforward", "affine")
 SLOT_JITTER, SLOT_APPLIED, SLOT_SPEED = 5, 6, 7
 MV, DECI_RPS = 1e-3, 0.1
+
+
+def one_pole_hp(x, fc, fs):
+    """x less its one-pole low-pass at `fc`, from rest at zero (the evals' roughness filter)."""
+    k = 2 * np.pi * fc / fs
+    k = k / (k + 1)
+    return x - signal.lfilter([k], [1, k - 1], x, axis=0)
 
 
 def effort_logs(spec):

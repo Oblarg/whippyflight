@@ -36,7 +36,7 @@ pub const RISES: [Time; 2] = [Time::new(0.030), Time::new(0.010)];
 /// Axes flown (FRD): roll, pitch.
 pub const AXES: [usize; 2] = [0, 1];
 /// Motor roughness is the RMS of the commanded voltages high-passed here
-/// (whippyflight_betaflight.extract_noise ROUGH_HP_HZ, BF's own figure for a log).
+/// (whippyflight-fit noise's ROUGH_HP, BF's own figure for a log).
 pub const ROUGH_HP: Freq = Freq::new(50.0);
 
 fn s_curve(x: f64) -> f64 {

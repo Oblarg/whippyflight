@@ -1,0 +1,19 @@
+[package]
+name = "whippyflight-fit"
+description = "The whippyflight plant fit from Betaflight blackbox logs: log decoding, the regressions, fit diagnostics and sensor-noise extraction"
+keywords = ["blackbox", "betaflight", "system-identification", "multirotor"]
+categories = ["science::robotics"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+whippyflight-sim.workspace = true
+whippyflight-design.workspace = true
+whippyunits = { workspace = true, features = ["std"] }
+nalgebra.workspace = true
+serde_json.workspace = true
+rustfft = "6"

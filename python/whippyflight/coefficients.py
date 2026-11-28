@@ -85,7 +85,7 @@ def is_legacy(coeffs):
 
 
 def betaflight_frame(airframe):
-    """The `frame` block of a Betaflight QUADX airframe (fit_model's
+    """The `frame` block of a Betaflight QUADX airframe (the fit's
     `airframe` block)."""
     mixer = airframe.get("mixer", "QUADX")
     if mixer != "QUADX":

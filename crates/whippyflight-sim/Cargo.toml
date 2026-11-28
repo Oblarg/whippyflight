@@ -15,7 +15,7 @@ repository.workspace = true
 [dependencies]
 whippyflight-control = { workspace = true, features = ["std", "airframe-drag"] }
 whippyunits = { workspace = true, features = ["std"] }
-# The plant reads fit_model.py's coefficient JSON.
+# The plant reads whippyflight-fit's coefficient JSON.
 serde_json.workspace = true
 
 [dev-dependencies]

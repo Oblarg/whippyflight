@@ -69,8 +69,18 @@ class CorruptFrame(Exception):
     pass
 
 
+HIGH_RESOLUTION_SCALE = 10
+HIGH_RESOLUTION_FIELDS = ("gyroADC", "gyroUnfilt", "rcCommand", "setpoint")
+# The mixer throttle, logged at 1000× regardless.
+HIGH_RESOLUTION_UNSCALED = ("setpoint[3]",)
+
+
 class Log:
-    """One decoded log: header dict, main-frame columns, events."""
+    """One decoded log: header dict, main-frame columns (raw in `data`), events.
+
+    Columns read by name are in the usual units: a blackbox_high_resolution
+    log's gyro, rcCommand and rate setpoints, stored at 10×, come back divided.
+    """
 
     def __init__(self, header, names, data, events, stats):
         self.header = header
@@ -79,9 +89,14 @@ class Log:
         self.events = events
         self.stats = stats
         self._index = {n: i for i, n in enumerate(names)}
+        high_res = int(header.get("blackbox_high_resolution", 0)) != 0
+        self._scaled = frozenset(
+            n for n in names if high_res and n.split("[")[0] in HIGH_RESOLUTION_FIELDS
+            and n not in HIGH_RESOLUTION_UNSCALED)
 
     def __getitem__(self, name):
-        return self.data[:, self._index[name]]
+        col = self.data[:, self._index[name]]
+        return col / HIGH_RESOLUTION_SCALE if name in self._scaled else col
 
     def __contains__(self, name):
         return name in self._index
@@ -473,7 +488,7 @@ def _decode_log(buf, pos, end):
 
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "whippyflight", "bbl")
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def _cache_path(path):
@@ -532,7 +547,7 @@ def main():
         out = f"{prefix}.{n:02d}.csv"
         with open(out, "w") as f:
             f.write(",".join(f'"{name}"' for name in log.names) + "\n")
-            np.savetxt(f, log.data, fmt="%d", delimiter=",")
+            np.savetxt(f, np.column_stack([log[n] for n in log.names]), fmt="%.10g", delimiter=",")
         print(f"{out}: {log.craft} {len(log)} frames, {log.log_hz:.0f} Hz log, "
               f"{log.loop_hz:.0f} Hz loop, {log.stats}", file=sys.stderr)
 

@@ -131,13 +131,15 @@ pub struct ControllerState {
     reachable: Option<[RotPerSec; 3]>,
     /// The gains in use, `None` until the first tick.  Interpolation is the
     /// costliest part of a tick, so after the first tick it is spread over
-    /// two: one starts it ([`ScheduleStart`]) at that tick's speeds, the
-    /// next finishes it there and takes the result.  The motor speeds it is
-    /// scheduled on are low-passed far below the loop rate.  Takeoff
-    /// interpolates in full.
+    /// two unless [`Self::set_schedule_every_tick`]: one starts it
+    /// ([`ScheduleStart`]) at that tick's speeds, the next finishes it there
+    /// and takes the result.  The motor speeds it is scheduled on are
+    /// low-passed far below the loop rate.  Takeoff interpolates in full.
     schedule: Option<InterpolatedGains>,
     /// An interpolation started last tick.
     schedule_start: Option<ScheduleStart>,
+    /// See [`Self::set_schedule_every_tick`].
+    schedule_every_tick: bool,
 }
 
 impl ControllerState {
@@ -187,6 +189,7 @@ impl ControllerState {
             reachable: None,
             schedule: None,
             schedule_start: None,
+            schedule_every_tick: false,
         }
     }
 
@@ -251,6 +254,12 @@ impl ControllerState {
     /// motors get while they are saturated, when nothing corrects it.
     pub fn set_battery_lpf(&mut self, cutoff: Hertz) {
         self.battery_lpf = cutoff.max(Hertz::new(0.0));
+    }
+
+    /// Interpolate the gains in full every tick, for a loop with the time to,
+    /// rather than spreading each interpolation over two.
+    pub fn set_schedule_every_tick(&mut self, on: bool) {
+        self.schedule_every_tick = on;
     }
 
     /// Trace the feedback's schedule jitter into
@@ -420,7 +429,7 @@ impl ControllerState {
         // The feedforward switches on at takeoff, so it starts from gains at
         // this tick's speeds rather than the ground's.
         let interp = match (self.schedule.take(), self.schedule_start.take()) {
-            (Some(_), _) if took_off => interpolate_gains(&motor_rps, gains),
+            (Some(_), _) if took_off || self.schedule_every_tick => interpolate_gains(&motor_rps, gains),
             (Some(_), Some(start)) => start.finish(gains),
             (Some(current), None) => {
                 self.schedule_start = Some(ScheduleStart::new(&motor_rps, gains));

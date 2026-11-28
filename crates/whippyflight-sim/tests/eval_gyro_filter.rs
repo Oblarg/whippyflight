@@ -14,7 +14,7 @@
 //!
 //! Noise metrics hover on the logged path with measured gyro and eRPM noise
 //! replayed on top (common::noise, $NOISE_PATH): `rough_v` is the RMS of the
-//! 50 Hz-high-passed motor voltages (whippyflight_betaflight.extract_noise prints BF's own
+//! 50 Hz-high-passed motor voltages (whippyflight-fit noise prints BF's own
 //! PID's on the same log), `jitter` the RMS true body rate it causes.
 //! `NOISE_SCALE` scales the noise.
 
@@ -92,7 +92,7 @@ struct Metrics {
     trace: Vec<[Rate; 3]>,
 }
 
-const ROUGH_HP: Freq = Freq::new(50.0); // whippyflight_betaflight.extract_noise ROUGH_HP_HZ
+const ROUGH_HP: Freq = Freq::new(50.0); // whippyflight-fit noise ROUGH_HP
 
 const KICK: Rate = Rate::new(0.2); // added to the roll rate at SETTLE by `kick`
 

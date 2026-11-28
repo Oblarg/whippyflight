@@ -141,6 +141,31 @@ fn gains_follow_speeds_over_two_ticks() {
     assert_eq!(kp_at(&mut ctrl, 500.0), fast);
 }
 
+/// Scheduled every tick, the gains fly this tick's speeds, and turning it
+/// off mid-flight goes back to the two-tick split.
+#[test]
+fn gains_follow_speeds_every_tick() {
+    let gains = load_scheduled_gains(VoltPerRps::new(1.0));
+    let mut ctrl = ControllerState::new();
+    ctrl.set_schedule_every_tick(true);
+    let setpoint = make_setpoint([0.0; 3].map(RotPerSec::new), 0.5);
+    let mut sensors = make_sensors([0.0; 3].map(RotPerSec::new), BATTERY);
+    let mut kp_at = |ctrl: &mut ControllerState, speed: f32| {
+        sensors.motor_rps = [RotPerSec::new(speed); 4];
+        ctrl.update(&sensors, &setpoint, &gains);
+        ctrl.telemetry().kp_motor0[0]
+    };
+
+    let slow = kp_at(&mut ctrl, 100.0);
+    let fast = kp_at(&mut ctrl, 500.0);
+    assert!(fast > slow, "{fast:?} vs {slow:?}");
+    assert_eq!(kp_at(&mut ctrl, 100.0), slow);
+
+    ctrl.set_schedule_every_tick(false);
+    assert_eq!(kp_at(&mut ctrl, 500.0), slow);
+    assert_eq!(kp_at(&mut ctrl, 100.0), fast);
+}
+
 #[test]
 fn zero_error_produces_throttle_only() {
     let gains = load_identity_gains(Diag { kp: VoltPerRps::new(1.0), ..Diag::ZERO });

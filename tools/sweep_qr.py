@@ -78,7 +78,7 @@ def main():
     ap.add_argument("--coefficients", default=COEFFS,
                     help="fit JSON: generates the blobs and is the evals' plant")
     ap.add_argument("--noise", default=None,
-                    help="sensor-noise fixture (a firmware's extract_noise.py) from a log of "
+                    help="sensor-noise fixture (whippyflight-fit noise) from a log of "
                          "the --coefficients airframe; default: the evals' default fixture "
                          "(fixtures/airframes/meteor65_noise.bin)")
     ap.add_argument("--sigma-rate", type=float, nargs="+", default=SIGMA_RATE)

@@ -4,11 +4,12 @@ Where a log's flight sits in a .wfg blob's motor-speed space, and how far the
 gains the blob schedules there stray from the same gains frozen at hover (a
 fixed PID behind a mixer).
 
-    python -m whippyflight_betaflight.plot_occupancy GAINS.wfg OUT_DIR LOG [LOG ...] [--motor-poles N]
+    whippyflight-fit speeds LOG [LOG ...] -o SPEEDS.bin
+    python -m whippyflight_betaflight.plot_occupancy GAINS.wfg OUT_DIR SPEEDS.bin
 
-Each LOG is a .bbl/.bfl (its every usable flight, or LOG#n for its n-th) or a
-blackbox_decode CSV, as fit_model takes them; their flights are pooled, and
-only their airborne, impact-free samples count (fit_model's gating).
+SPEEDS.bin is the flights' motor speeds over their airborne, impact-free
+samples, pooled (whippyflight-fit's gating; the format is its occupancy
+module's).
 Writes OUT_DIR/occupancy.png: per motor, the flight time over its own speed
 and the other three's mean (the axes of plot_gains' lattices), and over the
 spread of the four speeds; and OUT_DIR/deviation.png: per axis, a line per
@@ -29,12 +30,12 @@ Speeds off the grid clamp to it, as the firmware's do.  Needs matplotlib.
 
 import argparse
 import os
+import struct
 import sys
 
 import numpy as np
 
 from whippyflight import plot_gains as pg
-from whippyflight_betaflight.fit_model import load_flights, shaft_rps
 
 # Relative gain deviations the summaries count flight time beyond.
 THRESHOLDS = (0.1, 0.25, 0.5)
@@ -43,18 +44,17 @@ BINS = 80
 LINES = [("-", 3.0), ("--", 1.8), (":", 1.6), ("-.", 1.4)]
 
 
-def flight_speeds(specs, motor_poles=None):
-    """(labels, motor speeds [sample, motor] rev/s by BF motor index over the flights'
-    airborne samples, flight time per sample s)."""
-    flights = [f for spec in specs for f in load_flights(spec, motor_poles=motor_poles)]
-    if not flights:
-        raise SystemExit(f"no usable flight in {', '.join(specs)}")
-    rps, dt = [], []
-    for flight in flights:
-        speeds = np.column_stack([shaft_rps(flight.cols[f"eRPM[{i}]"], flight.motor_poles) for i in range(4)])
-        rps.append(speeds[flight.good])
-        dt.append(np.full(int(flight.good.sum()), 1.0 / flight.log_hz))
-    return [f.label for f in flights], np.concatenate(rps), np.concatenate(dt)
+def read_speeds(path):
+    """(labels, motor speeds [sample, motor] rev/s by BF motor index, flight time per sample s)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    (label_len,) = struct.unpack_from("<I", data, 0)
+    labels = data[4:4 + label_len].decode().split("\n")
+    (n,) = struct.unpack_from("<I", data, 4 + label_len)
+    rows = np.frombuffer(data, "<f4", count=5 * n, offset=8 + label_len).reshape(n, 5).astype(np.float64)
+    if not n:
+        raise SystemExit(f"{path} has no airborne samples")
+    return labels, rows[:, 1:], rows[:, 0]
 
 
 def beyond(x, dt, threshold):
@@ -198,13 +198,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("gains", help=".wfg blob")
     parser.add_argument("out_dir")
-    parser.add_argument("logs", nargs="+", metavar="LOG",
-                        help=".bbl/.bfl (LOG#n for its n-th flight) or blackbox_decode CSV")
-    parser.add_argument("--motor-poles", type=int, default=None,
-                        help="motor poles, for logs that don't record them")
+    parser.add_argument("speeds", help="the flights' gated motor speeds (whippyflight-fit speeds)")
     args = parser.parse_args()
     blob = pg.read_wfg(args.gains)
-    labels, rps, dt = flight_speeds(args.logs, args.motor_poles)
+    labels, rps, dt = read_speeds(args.speeds)
     dev, clamped = deviations(blob, rps)
     ff_dev = ff_deviations(blob, clamped)
     off_grid = beyond(np.any(clamped != rps, axis=1).astype(float), dt, 0.5)
